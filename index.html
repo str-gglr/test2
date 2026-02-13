@@ -3,27 +3,24 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Stable 3Hz</title>
+    <title>Sigil Scanner - Pro v1.0</title>
     <script src="opencv.js?v=20260214" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
         #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; max-height: 500px; overflow: hidden; border: 1px solid #222; }
         video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.7; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
-        
-        /* Start Overlay to allow vibration */
-        #gate { position: absolute; z-index: 100; width: 100%; height: 100%; background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: center; cursor: pointer; }
-        
+        #gate { position: absolute; z-index: 100; width: 100%; height: 100%; background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: center; cursor: pointer; letter-spacing: 2px; }
         #hud { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; z-index: 10; pointer-events: none; }
-        .status-box { background: rgba(10,10,10,0.8); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 10px 20px; text-align: center; width: 140px; transition: all 0.3s; }
-        #result { font-size: 1.8rem; font-weight: bold; color: #333; margin: 2px 0; }
+        .status-box { background: rgba(10,10,10,0.8); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 10px 20px; text-align: center; width: 140px; }
+        #result { font-size: 1.8rem; font-weight: bold; color: #444; }
         .success #result { color: #0f0; text-shadow: 0 0 10px #0f0; }
         .success { border-color: #0f0; background: rgba(0,40,0,0.4); }
     </style>
 </head>
 <body>
 
-    <div id="gate" onclick="initSystem()">TAP TO START SCANNER</div>
+    <div id="gate" onclick="initSystem()">INITIALIZE SCANNER</div>
 
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
@@ -45,7 +42,7 @@
 
     let cvReady = false;
     let lastScanTime = 0;
-    const SCAN_INTERVAL = 333; // 3 times per second (1000ms / 3)
+    const FPS_3 = 333; // 333ms = 3 FPS
 
     const GRID_SIZE = 400;
     const hCanvas = document.createElement('canvas');
@@ -57,7 +54,7 @@
         startCamera();
     }
 
-    var Module = { onRuntimeInitialized: () => { cvReady = true; console.log("Engine Ready."); } };
+    var Module = { onRuntimeInitialized: () => { cvReady = true; console.log("Logic Ready."); } };
 
     async function startCamera() {
         const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
@@ -70,10 +67,9 @@
 
     function loop(time) {
         if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
-            oCtx.clearRect(0, 0, overlay.width, overlay.height);
-            
-            // THROTTLING LOGIC
-            if (time - lastScanTime > SCAN_INTERVAL) {
+            // Only process 3 times per second
+            if (time - lastScanTime > FPS_3) {
+                oCtx.clearRect(0, 0, overlay.width, overlay.height);
                 processFrame();
                 lastScanTime = time;
             }
@@ -103,15 +99,16 @@
                 if (a > maxA) { maxA = a; maxI = i; }
             }
 
-            if (maxI !== -1 && maxA > 5000) { // Reject small noisy shapes
+            if (maxI !== -1 && maxA > 4500) {
                 let cnt = contours.get(maxI);
                 let hull = new cv.Mat(), approx = new cv.Mat();
                 cv.convexHull(cnt, hull, false, true);
-                cv.approxPolyDP(hull, approx, 0.07 * cv.arcLength(hull, true), true);
+                cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
                 if (approx.rows === 3) {
-                    drawUI(approx);
-                    if (warpAndDecode(src, approx)) foundValid = true;
+                    const result = warpAndDecode(src, approx);
+                    drawSubGrid(approx, result.bits); // Visualize calculated reconstruction
+                    if (result.success) foundValid = true;
                 }
                 hull.delete(); approx.delete();
             }
@@ -132,34 +129,43 @@
         let apex = pts[0], base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
 
         let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, base[0].x, base[0].y, base[1].x, base[1].y]);
-        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [200, 70, 75, 330, 325, 330]); // Internal inset sampling
+        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [200, 70, 75, 330, 325, 330]);
         let M = cv.getAffineTransform(srcPts, dstPts);
         let warped = new cv.Mat();
         cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
 
         cv.imshow(hCanvas, warped); 
-        const bits = sampleGrid();
         
-        let success = false;
-        // Strict Anchor Check: Anchor bits must be significantly darker than background
-        if (bits[0] === 1 && bits[9] === 1) {
-            success = validateSigil(bits);
-        }
+        // DYNAMIC NORMALIZATION
+        // Anchor 0 (Apex-Black), Anchor 9 (BL-Black), Anchor 15 (BR-White)
+        const black1 = getLum(200, 70+15);
+        const black2 = getLum(75, 330-15);
+        const whiteRef = getLum(325, 330-15);
+        
+        const blackPoint = (black1 + black2) / 2;
+        const whitePoint = whiteRef;
+        const threshold = (blackPoint + whitePoint) / 2;
+
+        const bits = sampleGrid(threshold);
+        const success = validateSigil(bits);
 
         warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
-        return success;
+        return { success, bits };
     }
 
-    function sampleGrid() {
+    function getLum(x, y) {
+        const p = hCtx.getImageData(x, y, 1, 1).data;
+        return (p[0] + p[1] + p[2]) / 3;
+    }
+
+    function sampleGrid(threshold) {
         const bits = [];
         const s = 250 / 4, h = s * Math.sin(Math.PI / 3), startY = 75;
         for (let row = 0; row < 4; row++) {
             for (let i = 0; i < (row * 2 + 1); i++) {
                 const x = 200 + (i - row) * (s / 2);
                 const y = startY + (row * h) + (h / 2);
-                const pix = hCtx.getImageData(x, y, 1, 1).data;
-                const brightness = (pix[0] + pix[1] + pix[2]) / 3;
-                bits.push(brightness < 110 ? 1 : 0);
+                bits.push(getLum(x, y) < threshold ? 1 : 0);
             }
         }
         return bits;
@@ -177,23 +183,32 @@
             const id = parseInt(D.join(''), 2);
             resultDisplay.textContent = id.toString().padStart(3, '0');
             statusBox.classList.add('success');
-            console.log("VALIDATED SIGIL ID:", id);
-            navigator.vibrate(100);
+            navigator.vibrate(50);
             return true;
         }
         return false;
     }
 
-    function drawUI(approx) {
+    function drawSubGrid(approx, bits) {
         const scale = overlay.width / GRID_SIZE;
-        oCtx.strokeStyle = "rgba(0, 255, 0, 0.5)";
-        oCtx.lineWidth = 2;
-        oCtx.beginPath();
-        oCtx.moveTo(approx.data32S[0]*scale, approx.data32S[1]*scale);
-        oCtx.lineTo(approx.data32S[2]*scale, approx.data32S[3]*scale);
-        oCtx.lineTo(approx.data32S[4]*scale, approx.data32S[5]*scale);
-        oCtx.closePath();
-        oCtx.stroke();
+        let pts = [];
+        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2]*scale, y: approx.data32S[i*2+1]*scale});
+        pts.sort((a, b) => a.y - b.y);
+        const apex = pts[0], bl = pts[1].x < pts[2].x ? pts[1] : pts[2], br = pts[1].x < pts[2].x ? pts[2] : pts[1];
+
+        oCtx.strokeStyle = "rgba(0, 255, 0, 0.3)";
+        oCtx.lineWidth = 1;
+
+        // Visual Reconstruction
+        for (let row = 0; row < 4; row++) {
+            const rowSteps = row + 1;
+            for (let i = 0; i < rowSteps; i++) {
+                // Simplified sub-triangle drawing for UI feedback
+                const x = apex.x + (i - row/2) * ((br.x - bl.x)/4);
+                const y = apex.y + (row + 0.5) * ((bl.y - apex.y)/4);
+                oCtx.strokeRect(x-2, y-2, 4, 4);
+            }
+        }
     }
 </script>
 </body>
