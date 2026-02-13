@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Omni Scanner</title>
+    <link rel="manifest" href="manifest.json">
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font-family: monospace; display: flex; flex-direction: column; height: 100vh; }
+        
+        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; overflow: hidden; }
+        video { position: absolute; min-width: 100%; min-height: 100%; object-fit: cover; opacity: 0.8; }
+        canvas { position: absolute; top: 0; left: 0; }
+        
+        #hud {
+            position: absolute; bottom: 50px; left: 0; width: 100%; 
+            display: flex; justify-content: center; pointer-events: none;
+            z-index: 20;
+        }
+
+        .status-box {
+            background: rgba(0, 0, 0, 0.85);
+            border: 2px solid #444;
+            border-radius: 12px;
+            padding: 20px 40px;
+            text-align: center;
+            min-width: 200px;
+            backdrop-filter: blur(4px);
+            transition: all 0.2s ease;
+        }
+
+        #label { color: #888; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 5px; }
+        #result { color: #fff; font-size: 3rem; font-weight: bold; letter-spacing: 2px; }
+        
+        .success { border-color: #0f0 !important; transform: scale(1.05); box-shadow: 0 0 40px rgba(0, 255, 0, 0.4); }
+        .success #result { color: #0f0 !important; text-shadow: 0 0 20px #0f0 !important; }
+        .success #label { color: #0f0; }
+
+        /* Scanning line */
+        .scanner-line {
+            position: absolute; top: 50%; left: 50%; width: 320px; height: 2px;
+            background: rgba(0, 255, 255, 0.5); transform: translate(-50%, -50%);
+            box-shadow: 0 0 10px cyan;
+            animation: scan 2s infinite ease-in-out; pointer-events: none;
+        }
+        @keyframes scan {
+            0% { transform: translate(-50%, -160px); opacity: 0; }
+            50% { opacity: 1; }
+            100% { transform: translate(-50%, 160px); opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="camContainer">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+        <div class="scanner-line"></div>
+    </div>
+
+    <div id="hud">
+        <div class="status-box" id="statusBox">
+            <div id="label">Align Shape</div>
+            <div id="result">--</div>
+        </div>
+    </div>
+
+<script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const resultDisplay = document.getElementById('result');
+    const statusLabel = document.getElementById('label');
+    const statusBox = document.getElementById('statusBox');
+
+    // Config
+    const GRID_SIZE = 300; 
+    const SCAN_INTERVAL_MS = 100; 
+    
+    // Rotation Maps (Pre-calculated permutations of the 16-triangle grid)
+    // Indices based on reading: 0=Top, 9=BotLeft, 15=BotRight
+    const ROTATION_MAPS = [
+        // 0° (Standard): White Zero is at Index 15
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        
+        // 120° (CW): White Zero is at Index 9
+        // Maps Physical Index [i] -> Screen Index [value]
+        [15, 8, 7, 13, 3, 14, 6, 12, 11, 0, 5, 1, 2, 4, 10, 9],
+
+        // 240° (CW): White Zero is at Index 0
+        [9, 11, 12, 4, 13, 10, 6, 2, 1, 15, 14, 8, 7, 3, 5, 0]
+    ];
+
+    let stream = null;
+    let lastValidID = null;
+    const hiddenCanvas = document.createElement('canvas');
+    const hCtx = hiddenCanvas.getContext('2d', { willReadFrequently: true });
+
+    async function startCamera() {
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { facingMode: { exact: "environment" } } 
+            }).catch(() => navigator.mediaDevices.getUserMedia({ video: true }));
+
+            video.srcObject = stream;
+            video.onloadedmetadata = () => {
+                resize();
+                requestAnimationFrame(drawOverlay);
+                setInterval(scanFrame, SCAN_INTERVAL_MS);
+            };
+        } catch (err) {
+            statusLabel.textContent = "Error";
+            resultDisplay.textContent = "No Cam";
+        }
+    }
+
+    function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        hiddenCanvas.width = window.innerWidth;
+        hiddenCanvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+
+    function getTriangleCenters(centerX, centerY) {
+        const size = GRID_SIZE / 4; 
+        const h = size * Math.sin(Math.PI / 3);
+        const startY = centerY - (2 * h);
+        let points = [];
+        for (let row = 0; row < 4; row++) {
+            const numInRow = (row * 2) + 1;
+            for (let i = 0; i < numInRow; i++) {
+                const centerOffsetIndex = i - ((numInRow - 1) / 2);
+                const x = centerX + (centerOffsetIndex * (size / 2));
+                const y = startY + (row * h) + (h/2);
+                points.push({x, y, i: points.length, up: i%2===0});
+            }
+        }
+        return points;
+    }
+
+    function drawOverlay() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const cx = canvas.width / 2;
+        const cy = canvas.height / 2;
+        const points = getTriangleCenters(cx, cy);
+        const color = statusBox.classList.contains('success') ? '#0f0' : 'rgba(255, 255, 255, 0.4)';
+        
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+
+        points.forEach((p) => {
+            const size = GRID_SIZE / 4;
+            const h = size * Math.sin(Math.PI / 3);
+            
+            // Draw Target Dot
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 2, 0, Math.PI*2);
+            ctx.fillStyle = color;
+            ctx.fill();
+
+            // Draw Triangle
+            ctx.beginPath();
+            let tipY = p.up ? p.y - h/2 : p.y + h/2;
+            let baseY = p.up ? p.y + h/2 : p.y - h/2;
+            if(p.up) {
+                ctx.moveTo(p.x, tipY);
+                ctx.lineTo(p.x - size/2, baseY);
+                ctx.lineTo(p.x + size/2, baseY);
+            } else {
+                ctx.moveTo(p.x - size/2, baseY);
+                ctx.lineTo(p.x + size/2, baseY);
+                ctx.lineTo(p.x, tipY);
+            }
+            ctx.closePath();
+            ctx.stroke();
+        });
+        requestAnimationFrame(drawOverlay);
+    }
+
+    function scanFrame() {
+        if (video.readyState !== video.HAVE_ENOUGH_DATA) return;
+
+        hCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const cx = canvas.width / 2;
+        const cy = canvas.height / 2;
+        const points = getTriangleCenters(cx, cy);
+        
+        // 1. Get raw brightness readings (0-255)
+        const readings = points.map(p => {
+            const px = hCtx.getImageData(p.x, p.y, 1, 1).data;
+            return (px[0]*0.299 + px[1]*0.587 + px[2]*0.114);
+        });
+
+        // 2. Determine Dynamic Threshold using the 3 Corners
+        // One of these is White (high), two are Black (low).
+        const c1 = readings[0];  // Top
+        const c2 = readings[9];  // BotLeft
+        const c3 = readings[15]; // BotRight
+        const minVal = Math.min(c1, c2, c3);
+        const maxVal = Math.max(c1, c2, c3);
+        
+        // Gate: If contrast is too low, image is garbage
+        if ((maxVal - minVal) < 40) return resetUI();
+
+        const threshold = (minVal + maxVal) / 2;
+        const rawBits = readings.map(r => r < threshold ? 1 : 0); // 1=Black, 0=White
+
+        // 3. Determine Orientation & Validate
+        let mapIndex = -1;
+
+        // Check 0°: Top=1, Left=1, Right=0
+        if (rawBits[0]===1 && rawBits[9]===1 && rawBits[15]===0) mapIndex = 0;
+        // Check 120°: Top=0, Left=1, Right=1 (Top is now the White Zero)
+        else if (rawBits[0]===0 && rawBits[9]===1 && rawBits[15]===1) mapIndex = 2; // Actually this is 240 logic visually
+        // Check 240°: Top=1, Left=0, Right=1 (Left is now the White Zero)
+        else if (rawBits[0]===1 && rawBits[9]===0 && rawBits[15]===1) mapIndex = 1;
+
+        if (mapIndex === -1) return resetUI();
+
+        // 4. Decode with Orientation Map
+        const map = ROTATION_MAPS[mapIndex];
+        const bits = map.map(i => rawBits[i]);
+
+        // 5. Parity Check
+        // Extract Data bits
+        const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
+        // Extract Parity bits
+        const S_Read = { S1: bits[2], S2: bits[6], S3: bits[10], S4: bits[14] };
+        
+        // Calculate expected Parity
+        const S1_Calc = D[0] ^ D[1] ^ D[3] ^ D[4] ^ D[6] ^ D[8];
+        const S2_Calc = D[2] ^ D[3] ^ D[4] ^ D[5] ^ D[7] ^ D[8];
+        const S3_Calc = D[0] ^ D[2] ^ D[3] ^ D[6] ^ D[7];
+        const S4_Calc = D[1] ^ D[4] ^ D[5] ^ D[7] ^ D[8];
+
+        if (S_Read.S1 === S1_Calc && S_Read.S2 === S2_Calc && 
+            S_Read.S3 === S3_Calc && S_Read.S4 === S4_Calc) {
+            
+            const id = parseInt(D.join(''), 2);
+            showSuccess(id);
+        } else {
+            resetUI();
+        }
+    }
+
+    function showSuccess(id) {
+        if(lastValidID !== id && navigator.vibrate) navigator.vibrate(50);
+        lastValidID = id;
+        statusBox.classList.add('success');
+        statusLabel.textContent = "DETECTED";
+        resultDisplay.textContent = id;
+    }
+
+    function resetUI() {
+        statusBox.classList.remove('success');
+        statusLabel.textContent = "Scanning...";
+    }
+
+    startCamera();
+</script>
+</body>
+</html>
