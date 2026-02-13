@@ -3,25 +3,24 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Field Eval</title>
+    <title>Sigil Scanner - Auto 3s</title>
     <script src="opencv.js" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
         #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; max-height: 500px; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.5; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.4; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }
-        #gate { position: absolute; z-index: 100; width: 100%; height: 100%; background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: center; cursor: pointer; }
-        #result { font-size: 2.5rem; font-weight: bold; color: #0f0; margin-top: 20px; text-shadow: 0 0 10px #0f0; }
+        #result { font-size: 2.5rem; font-weight: bold; color: #666; margin-top: 20px; transition: all 0.3s; }
+        .active-id { color: #0f0 !important; text-shadow: 0 0 15px #0f0; }
     </style>
 </head>
 <body>
 
-    <div id="gate" onclick="initSystem()">START CALIBRATED SCAN</div>
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
     </div>
-    <div id="result">---</div>
+    <div id="result">ID: ---</div>
 
 <script>
     const video = document.getElementById('video');
@@ -31,35 +30,48 @@
 
     let cvReady = false;
     let lastScanTime = 0;
+    let lockUntil = 0; // Timer for the 3-second refresh
+    
     const GRID_SIZE = 400;
     const hCanvas = document.createElement('canvas');
     hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d');
 
-    function initSystem() { document.getElementById('gate').style.display = 'none'; startCamera(); }
-    var Module = { onRuntimeInitialized: () => { cvReady = true; } };
+    // AUTO-START
+    window.onload = () => {
+        var checkCV = setInterval(() => {
+            if (typeof cv !== 'undefined' && cv.Mat) {
+                cvReady = true;
+                clearInterval(checkCV);
+                startCamera();
+            }
+        }, 100);
+    };
 
     async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        video.srcObject = stream;
-        video.onloadedmetadata = () => {
-            overlay.width = overlay.height = camContainer.clientWidth;
-            requestAnimationFrame(loop);
-        };
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+            video.srcObject = stream;
+            video.onloadedmetadata = () => {
+                overlay.width = overlay.height = camContainer.clientWidth;
+                requestAnimationFrame(loop);
+            };
+        } catch (e) { resultDisplay.textContent = "CAM ERROR"; }
     }
 
     function loop(time) {
         if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
-            if (time - lastScanTime > 333) { // 3 FPS
+            // Only scan if 333ms passed AND we aren't in a 3s success lock
+            if (time > lockUntil && time - lastScanTime > 333) {
                 oCtx.clearRect(0, 0, overlay.width, overlay.height);
-                processFrame();
+                processFrame(time);
                 lastScanTime = time;
             }
         }
         requestAnimationFrame(loop);
     }
 
-    function processFrame() {
+    function processFrame(currentTime) {
         const minD = Math.min(video.videoWidth, video.videoHeight);
         hCtx.drawImage(video, (video.videoWidth-minD)/2, (video.videoHeight-minD)/2, minD, minD, 0, 0, GRID_SIZE, GRID_SIZE);
 
@@ -78,15 +90,21 @@
         }
 
         if (maxI !== -1 && maxA > 4000) {
-            let approx = new cv.Mat();
-            let hull = new cv.Mat();
+            let approx = new cv.Mat(), hull = new cv.Mat();
             cv.convexHull(contours.get(maxI), hull);
             cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
             if (approx.rows === 3) {
                 const c = sortCorners(approx);
-                drawWireframe(c);
-                evaluateBits(gray, c);
+                const decode = evaluateBits(gray, c);
+                
+                if (decode.success) {
+                    drawReconstruction(c, decode.bits); // Show bits at 50% opacity
+                    resultDisplay.textContent = "ID: " + decode.id.toString().padStart(3, '0');
+                    resultDisplay.classList.add('active-id');
+                    lockUntil = currentTime + 3000; // Freeze for 3 seconds
+                    setTimeout(() => { resultDisplay.classList.remove('active-id'); }, 3000);
+                }
             }
             approx.delete(); hull.delete();
         }
@@ -104,40 +122,32 @@
     }
 
     function evaluateBits(grayMat, c) {
-        // Step 1: Establish Anchor Reference Levels
         const blackVal = (getPointLum(grayMat, c.a) + getPointLum(grayMat, c.bl)) / 2;
         const whiteVal = getPointLum(grayMat, c.br);
         const threshold = (blackVal + whiteVal) / 2;
 
         const bits = [];
-        // Step 2: Traverse the 16 triangles using the wireframe geometry
         for (let row = 0; row < 4; row++) {
             for (let i = 0; i < (row * 2 + 1); i++) {
-                // Calculate center point of each sub-triangle mathematically
                 const tY = (row + 0.5) / 4;
                 const tX = (i + 0.5) / (row * 2 + 1);
-                
                 const y = c.a.y + (c.bl.y - c.a.y) * tY;
                 const xLeft = c.a.x + (c.bl.x - c.a.x) * tY;
                 const xRight = c.a.x + (c.br.x - c.a.x) * tY;
                 const x = xLeft + (xRight - xLeft) * tX;
-
-                const lum = getPointLum(grayMat, {x, y});
-                bits.push(lum < threshold ? 1 : 0);
+                bits.push(getPointLum(grayMat, {x, y}) < threshold ? 1 : 0);
             }
         }
 
-        // Validate Parity
         if (bits[0] === 1 && bits[9] === 1) {
             const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
             const S_R = [bits[2], bits[6], bits[10], bits[14]];
             const S_C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
-            
             if (S_R.every((v, i) => v === S_C[i])) {
-                resultDisplay.textContent = "ID: " + parseInt(D.join(''), 2).toString().padStart(3, '0');
-                navigator.vibrate(100);
+                return { success: true, id: parseInt(D.join(''), 2), bits: bits };
             }
         }
+        return { success: false };
     }
 
     function getPointLum(mat, p) {
@@ -145,21 +155,31 @@
         return mat.ucharPtr(Math.floor(p.y), Math.floor(p.x))[0];
     }
 
-    function drawWireframe(c) {
+    function drawReconstruction(c, bits) {
         const s = overlay.width / GRID_SIZE;
-        oCtx.strokeStyle = "#0f0"; oCtx.lineWidth = 2;
+        oCtx.lineWidth = 1;
+        
+        let bitIdx = 0;
+        for (let row = 0; row < 4; row++) {
+            const yTop = (c.a.y + (c.bl.y - c.a.y) * (row / 4)) * s;
+            const yBot = (c.a.y + (c.bl.y - c.a.y) * ((row + 1) / 4)) * s;
+            
+            for (let i = 0; i < (row * 2 + 1); i++) {
+                // Geometric vertex calculation for the visual fill
+                const x0 = (c.a.x + (c.bl.x - c.a.x) * (row / 4) + (i - row) * (c.br.x - c.bl.x) / 8) * s;
+                // Simple triangle rendering for the overlay
+                oCtx.fillStyle = bits[bitIdx] === 1 ? "rgba(0, 255, 0, 0.5)" : "rgba(255, 255, 255, 0.2)";
+                oCtx.beginPath();
+                oCtx.arc(x0, yTop + (yBot-yTop)/2, 5, 0, Math.PI * 2); // Visual indicator for bit centers
+                oCtx.fill();
+                bitIdx++;
+            }
+        }
+        // Outer Wireframe
+        oCtx.strokeStyle = "#0f0";
         oCtx.beginPath();
         oCtx.moveTo(c.a.x*s, c.a.y*s); oCtx.lineTo(c.bl.x*s, c.bl.y*s);
         oCtx.lineTo(c.br.x*s, c.br.y*s); oCtx.closePath(); oCtx.stroke();
-        
-        // Draw the internal grid lines to confirm evaluation points
-        for (let i = 1; i < 4; i++) {
-            let t = i / 4;
-            // Horizontal lines
-            oCtx.moveTo((c.a.x + (c.bl.x - c.a.x)*t)*s, (c.a.y + (c.bl.y - c.a.y)*t)*s);
-            oCtx.lineTo((c.a.x + (c.br.x - c.a.x)*t)*s, (c.a.y + (c.br.y - c.a.y)*t)*s);
-        }
-        oCtx.stroke();
     }
 </script>
 </body>
