@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Debug v4</title>
+    <title>Sigil Scanner - Robust v5</title>
     <script src="opencv.js?v=20260213" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
@@ -15,7 +15,7 @@
         .status-box { 
             background: rgba(10,10,10,0.5); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; 
             padding: 10px 20px; text-align: center; backdrop-filter: blur(5px);
-            display: flex; flex-direction: column; align-items: center; width: 160px; /* Smaller & 50% opacity */
+            display: flex; flex-direction: column; align-items: center; width: 160px;
         }
         #result { font-size: 1.8rem; font-weight: bold; color: #666; margin: 2px 0; }
         .label { font-size: 0.6rem; letter-spacing: 1px; color: #aaa; text-transform: uppercase; }
@@ -58,19 +58,21 @@
     var Module = {
         onRuntimeInitialized: () => { 
             cvReady = true; 
-            console.log("CV Engine: Online");
+            console.info("OpenCV.js Initialized");
             startCamera();
         }
     };
 
     async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        video.srcObject = stream;
-        video.onloadedmetadata = () => {
-            overlay.width = window.innerWidth;
-            overlay.height = window.innerHeight;
-            requestAnimationFrame(loop);
-        };
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+            video.srcObject = stream;
+            video.onloadedmetadata = () => {
+                overlay.width = window.innerWidth;
+                overlay.height = window.innerHeight;
+                requestAnimationFrame(loop);
+            };
+        } catch(e) { console.error("Camera access denied"); }
     }
 
     function loop() {
@@ -86,29 +88,40 @@
         let src = cv.imread(hCanvas);
         let gray = new cv.Mat();
         let binary = new cv.Mat();
+        let blurred = new cv.Mat();
         
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        // Relaxed threshold for better contrast in shadows
-        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 15, 6);
+
+        // PRE-PROCESSING: Blur internal details
+        let ksize = new cv.Size(7, 7);
+        cv.GaussianBlur(gray, blurred, ksize, 0, 0, cv.BORDER_DEFAULT);
+
+        // THRESHOLD: Adaptive helps in shadows
+        cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
+
+        // MORPHOLOGY: Close gaps in the outer triangle line
+        let M_morph = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+        cv.morphologyEx(binary, binary, cv.MORPH_CLOSE, M_morph);
 
         let contours = new cv.MatVector();
         let hierarchy = new cv.Mat();
         cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
         let validThisFrame = false;
-        if (Math.random() > 0.95) console.debug(`Scanning... Found ${contours.size()} contours`);
 
         for (let i = 0; i < contours.size(); ++i) {
             let cnt = contours.get(i);
             let area = cv.contourArea(cnt);
-            if (area > 1500) { // Reduced area requirement for distance
+            
+            // Filter by size: not too small, not the whole screen
+            if (area > 2000 && area < 85000) { 
                 let approx = new cv.Mat();
                 let peri = cv.arcLength(cnt, true);
-                // epsilon 0.06: More forgiving for rounded/shaky chalk lines
-                cv.approxPolyDP(cnt, approx, 0.06 * peri, true);
+                // epsilon 0.08: High tolerance for hand-drawn shapes
+                cv.approxPolyDP(cnt, approx, 0.08 * peri, true);
 
                 if (approx.rows === 3) {
-                    drawLiveOutline(approx); // Nice green wireframe is back
+                    drawLiveOutline(approx); // Visible wireframe
                     if (warpAndDecode(src, approx)) validThisFrame = true;
                 }
                 approx.delete();
@@ -122,7 +135,8 @@
             statusLabel.textContent = "Scanning...";
         }
 
-        src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete();
+        src.delete(); gray.delete(); binary.delete(); blurred.delete(); 
+        contours.delete(); hierarchy.delete(); M_morph.delete();
     }
 
     function warpAndDecode(src, approx) {
@@ -132,6 +146,7 @@
         let apex = pts[0], base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
         let bl = base[0], br = base[1];
 
+        // Normalizing the perspective
         let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
         let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 40, 40, 260, 260, 260]);
         let M = cv.getAffineTransform(srcPts, dstPts);
@@ -142,10 +157,11 @@
         const bits = sampleWarpedGrid();
         
         let success = false;
-        if (bits[0] === 1 && bits[9] === 1) { // Anchors OK
+        // Verify Anchors
+        if (bits[0] === 1 && bits[9] === 1) {
             success = validateSigil(bits);
         } else {
-            if (Math.random() > 0.9) console.warn("Anchor missing (Top/Left). Check orientation.");
+            if (Math.random() > 0.98) console.debug("Anchor Check Failed");
         }
 
         warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
@@ -164,7 +180,8 @@
                 const y = startY + (row * h) + (h / 2);
                 const pix = hCtx.getImageData(x, y, 1, 1).data;
                 const brightness = (pix[0] + pix[1] + pix[2]) / 3;
-                bits.push(brightness < 110 ? 1 : 0); // Aggressive dark detection
+                // Sampling threshold for dark sigil cells
+                bits.push(brightness < 115 ? 1 : 0);
             }
         }
         return bits;
@@ -187,26 +204,24 @@
                 lastDetectedId = currentId;
             }
 
+            // 3-hit stability rule
             if (idMatchCount >= REQUIRED_MATCHES) {
                 resultDisplay.textContent = currentId.toString().padStart(3, '0');
                 statusLabel.textContent = "LOCKED";
                 statusBox.classList.add('success');
                 drawReconstructionOverlay(bits);
-                navigator.vibrate(50); // Haptic feedback for Mark
+                if (idMatchCount === REQUIRED_MATCHES) navigator.vibrate(50);
                 return true;
             }
-        } else {
-            console.debug(`Parity fail: Bits: ${bits.join('')}`);
         }
         return false;
     }
 
     function drawLiveOutline(approx) {
-        // Map 300x300 hidden canvas points to real screen resolution
         const scaleX = window.innerWidth / GRID_SIZE;
         const scaleY = window.innerHeight / GRID_SIZE;
-        oCtx.strokeStyle = "rgba(0, 255, 0, 0.8)";
-        oCtx.lineWidth = 2;
+        oCtx.strokeStyle = "rgba(0, 255, 0, 0.7)";
+        oCtx.lineWidth = 3;
         oCtx.beginPath();
         oCtx.moveTo(approx.data32S[0]*scaleX, approx.data32S[1]*scaleY);
         oCtx.lineTo(approx.data32S[2]*scaleX, approx.data32S[3]*scaleY);
@@ -220,7 +235,7 @@
         const s = Math.min(overlay.width, overlay.height) * 0.45; 
         const h = s * Math.sin(Math.PI / 3);
         oCtx.save();
-        oCtx.globalAlpha = 0.5;
+        oCtx.globalAlpha = 0.5; // Request 50% opacity
         oCtx.translate(centerX, centerY - h/2);
         let idx = 0;
         const cellSize = s / 4, cellH = cellSize * Math.sin(Math.PI / 3);
@@ -235,6 +250,7 @@
                 }
                 oCtx.fillStyle = bits[idx] ? "#0f0" : "rgba(0,0,0,0.1)";
                 oCtx.fill();
+                oCtx.strokeStyle = "rgba(0,255,0,0.2)";
                 oCtx.stroke();
                 idx++;
             }
