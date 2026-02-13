@@ -1,4 +1,4 @@
-const CACHE_NAME = 'sigil-scanner-auto-v2.2';
+const CACHE_NAME = 'sigil-scanner-auto-v2.21';
 const ASSETS = [ 
   './', 
   './index.html', 
