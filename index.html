@@ -12,7 +12,19 @@
         canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
         
         #hud { position: absolute; bottom: 20px; width: 100%; display: flex; flex-direction: column; align-items: center; gap: 15px; z-index: 10; }
-        .status-box { background: rgba(20,20,20,0.9); border: 1px solid #444; border-radius: 12px; padding: 15px; text-align: center; min-width: 200px; backdrop-filter: blur(5px); }
+        .status-box { 
+            background: rgba(20,20,20,0.9); 
+            border: 1px solid #444; 
+            border-radius: 12px; 
+            padding: 15px; 
+            /* ADD THESE THREE LINES */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            
+            min-width: 200px; 
+            backdrop-filter: blur(5px); 
+        }
         #reconCanvas { width: 120px; height: 110px; background: #111; border-radius: 8px; border: 1px solid #333; margin-top: 10px; }
         #result { font-size: 2rem; font-weight: bold; margin: 5px 0; }
         .success { border-color: #0f0; color: #0f0; }
@@ -81,22 +93,38 @@
     function processFrame() {
         let src = cv.imread(video);
         let gray = new cv.Mat();
+        let binary = new cv.Mat();
+        
+        // 1. Convert and Threshold
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        cv.threshold(gray, gray, 100, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+        // Using ADAPTIVE threshold is much better for street lighting than static
+        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
+
+        // 2. DILATE (Thicken lines to close gaps in chalk/hand-drawing)
+        let M_dilate = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+        cv.dilate(binary, binary, M_dilate);
+
+        // DEBUG: Show what the computer "sees" in the small box when seeking
+        if (!statusBox.classList.contains('success')) {
+            cv.imshow(reconCanvas, binary); 
+        }
 
         let contours = new cv.MatVector();
         let hierarchy = new cv.Mat();
-        cv.findContours(gray, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
         for (let i = 0; i < contours.size(); ++i) {
             let cnt = contours.get(i);
             let area = cv.contourArea(cnt);
-            if (area > 5000) {
+            
+            // Lowered threshold to 2000 to detect sigils further away
+            if (area > 2000) { 
                 let peri = cv.arcLength(cnt, true);
                 let approx = new cv.Mat();
-                cv.approxPolyDP(cnt, approx, 0.04 * peri, true);
+                // Loosened approximation to 0.05 for messy hand-drawings
+                cv.approxPolyDP(cnt, approx, 0.05 * peri, true);
 
-                if (approx.rows === 3) { // Found a triangle!
+                if (approx.rows === 3) {
                     warpAndDecode(src, approx);
                     drawOutline(approx);
                 }
@@ -104,7 +132,9 @@
             }
             cnt.delete();
         }
-        src.delete(); gray.delete(); contours.delete(); hierarchy.delete();
+        
+        // Clean up
+        src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete(); M_dilate.delete();
     }
 
     function warpAndDecode(src, approx) {
