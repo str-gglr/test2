@@ -3,31 +3,24 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner v2</title>
-    <script src="opencv.js" defer></script>
+    <title>Sigil Scanner v2 - PobleSec Edition</title>
+    <script src="opencv.js?v=20260213" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
-        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.5; }
-        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; overflow: hidden; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.6; }
+        canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
         
-        #hud { position: absolute; bottom: 20px; width: 100%; display: flex; flex-direction: column; align-items: center; gap: 15px; z-index: 10; }
+        #hud { position: absolute; bottom: 30px; width: 100%; display: flex; justify-content: center; z-index: 10; }
         .status-box { 
-            background: rgba(20,20,20,0.9); 
-            border: 1px solid #444; 
-            border-radius: 12px; 
-            padding: 15px; 
-            /* ADD THESE THREE LINES */
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            
-            min-width: 200px; 
-            backdrop-filter: blur(5px); 
+            background: rgba(15,15,15,0.95); border: 1px solid #333; border-radius: 12px; 
+            padding: 20px; text-align: center; min-width: 240px; backdrop-filter: blur(10px);
+            display: flex; flex-direction: column; align-items: center; gap: 10px;
         }
-        #reconCanvas { width: 120px; height: 110px; background: #111; border-radius: 8px; border: 1px solid #333; margin-top: 10px; }
-        #result { font-size: 2rem; font-weight: bold; margin: 5px 0; }
-        .success { border-color: #0f0; color: #0f0; }
+        #reconCanvas { width: 140px; height: 120px; background: #050505; border-radius: 4px; border: 1px solid #222; }
+        #result { font-size: 2.2rem; font-weight: bold; color: #0f0; text-shadow: 0 0 10px #0f0; margin: 5px 0; }
+        .label { font-size: 0.7rem; letter-spacing: 2px; color: #888; text-transform: uppercase; }
+        .success { border-color: #0f0 !important; box-shadow: 0 0 15px rgba(0,255,0,0.2); }
     </style>
 </head>
 <body>
@@ -39,9 +32,10 @@
 
     <div id="hud">
         <div class="status-box" id="statusBox">
-            <div style="font-size: 0.7rem; letter-spacing: 1px;">SYSTEM STATUS: <span id="label">INITIALIZING CV...</span></div>
+            <div class="label" id="statusLabel">Initializing CV...</div>
             <div id="result">---</div>
             <canvas id="reconCanvas"></canvas>
+            <div class="label" style="margin-top:5px">Decoded Sigil View</div>
         </div>
     </div>
 
@@ -53,33 +47,38 @@
     const rCtx = reconCanvas.getContext('2d');
     const statusBox = document.getElementById('statusBox');
     const resultDisplay = document.getElementById('result');
-    const label = document.getElementById('label');
+    const statusLabel = document.getElementById('statusLabel');
 
     let cvReady = false;
     const GRID_SIZE = 300;
-    const hCanvas = document.createElement('canvas');
+    const hCanvas = document.createElement('canvas'); // Hidden canvas for warping
     hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d', { willReadFrequently: true });
 
-    // Logical grid mapping
-    const GRID_MAP = [
-        "A1", "D1", "S1", "D2", "D3", "D4", "S2", "D5", "D6", "A2", "S3", "D7", "D8", "D9", "S4", "Z"
-    ];
-
-    window.onOpenCvReady = () => { 
-        cvReady = true; 
-        label.textContent = "SEEKING SIGILS";
-        startCamera();
+    // Handle OpenCV Initialization
+    var Module = {
+        onRuntimeInitialized: () => { 
+            cvReady = true; 
+            statusLabel.textContent = "Seeking Sigil...";
+            startCamera();
+        }
     };
 
     async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        video.srcObject = stream;
-        video.onloadedmetadata = () => {
-            overlay.width = window.innerWidth;
-            overlay.height = window.innerHeight;
-            requestAnimationFrame(loop);
-        };
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                video: { facingMode: "environment", focusMode: "continuous" } 
+            });
+            video.srcObject = stream;
+            video.onloadedmetadata = () => {
+                overlay.width = window.innerWidth;
+                overlay.height = window.innerHeight;
+                requestAnimationFrame(loop);
+            };
+        } catch (err) {
+            statusLabel.textContent = "Camera Error";
+            console.error(err);
+        }
     }
 
     function loop() {
@@ -91,28 +90,19 @@
     }
 
     function processFrame() {
-    // 1. Draw the current video frame onto the hidden canvas first
-    hCtx.drawImage(video, 0, 0, hCanvas.width, hCanvas.height);
-
-    // 2. Point OpenCV to the CANVAS element, not the video object
-    let src = cv.imread(hCanvas); 
-    
-    let gray = new cv.Mat();
-    let binary = new cv.Mat();
+        // Draw video frame to hidden canvas for OpenCV to read
+        hCtx.drawImage(video, 0, 0, GRID_SIZE, GRID_SIZE);
+        let src = cv.imread(hCanvas);
+        let gray = new cv.Mat();
+        let binary = new cv.Mat();
         
-        // 1. Convert and Threshold
+        // Step 1: Adaptive Threshold for street lighting
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        // Using ADAPTIVE threshold is much better for street lighting than static
-        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
+        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 4);
 
-        // 2. DILATE (Thicken lines to close gaps in chalk/hand-drawing)
+        // Step 2: Dilation to repair chalk line gaps
         let M_dilate = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
         cv.dilate(binary, binary, M_dilate);
-
-        // DEBUG: Show what the computer "sees" in the small box when seeking
-        if (!statusBox.classList.contains('success')) {
-            cv.imshow(reconCanvas, binary); 
-        }
 
         let contours = new cv.MatVector();
         let hierarchy = new cv.Mat();
@@ -120,148 +110,123 @@
 
         for (let i = 0; i < contours.size(); ++i) {
             let cnt = contours.get(i);
-            let area = cv.contourArea(cnt);
-            
-            // Lowered threshold to 2000 to detect sigils further away
-            if (area > 2000) { 
-                let peri = cv.arcLength(cnt, true);
+            if (cv.contourArea(cnt) > 2500) {
                 let approx = new cv.Mat();
-                // Loosened approximation to 0.05 for messy hand-drawings
-                cv.approxPolyDP(cnt, approx, 0.05 * peri, true);
+                cv.approxPolyDP(cnt, approx, 0.05 * cv.arcLength(cnt, true), true);
 
-                if (approx.rows === 3) {
+                if (approx.rows === 3) { // Big Triangle Found
                     warpAndDecode(src, approx);
-                    drawOutline(approx);
+                    drawOverlayOutline(approx);
                 }
                 approx.delete();
             }
             cnt.delete();
         }
-        
-        // Clean up
         src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete(); M_dilate.delete();
     }
 
     function warpAndDecode(src, approx) {
-    // 1. NORMALIZE POINTS: Find which corner is the "Top"
-    let pts = [];
-    for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
-    
-    // Logic: The "Apex" is the point furthest from the midpoint of the other two
-    // For street scanning, we assume the highest Y is the Apex (or use the Anchor check)
-    pts.sort((a, b) => a.y - b.y); 
-    let apex = pts[0]; 
-    let base = [pts[1], pts[2]].sort((a, b) => a.x - b.x);
-    let bl = base[0], br = base[1];
+        // Step 3: Perspective Normalization (Warping)
+        let pts = [];
+        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
+        pts.sort((a, b) => a.y - b.y); // Rough Apex finding
+        let apex = pts[0];
+        let base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        let bl = base[0], br = base[1];
 
-    // 2. DEFINE THE IDEAL GRID (300x300 square)
-    let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
-    let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 30, 30, 270, 270, 270]);
+        let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
+        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 40, 40, 260, 260, 260]);
+        let M = cv.getAffineTransform(srcPts, dstPts);
+        let warped = new cv.Mat();
+        cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
 
-    // 3. WARP: This flattens the perspective
-    let M = cv.getAffineTransform(srcPts, dstPts);
-    let warped = new cv.Mat();
-    cv.warpAffine(src, warped, M, new cv.Size(300, 300));
-    
-    // 4. DIVIDE INTO 4 LEVELS (The Matrix)
-    // Now that it's flat, we sample the 16 centers of the sub-triangles
-    cv.imshow(hCanvas, warped); // Render to hidden canvas for sampling
-    const bits = sampleWarpedGrid();
-    
-    // 5. READ ANCHORS & DATA
-    if (bits[0] === 1 && bits[9] === 1) { // Apex and Left-Anchor must be black
-        validateSigil(bits);
+        // Step 4: Divide and Sample Matrix
+        cv.imshow(hCanvas, warped);
+        const bits = sampleWarpedGrid();
+        
+        // Step 5: Anchors & Logic Verification
+        // Bit 0 = Apex Anchor, Bit 9 = Left Anchor
+        if (bits[0] === 1 && bits[9] === 1) {
+            validateSigil(bits);
+        }
+
+        warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
     }
 
-    // Memory Cleanup
-    warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
-}
-
-    function sampleGrid() {
-        const size = GRID_SIZE / 4;
+    function sampleWarpedGrid() {
+        const bits = [];
+        const size = 220 / 4; // Use usable triangle area
         const h = size * Math.sin(Math.PI / 3);
-        const startY = 20;
-        let bits = [];
+        const startY = 40;
         
         for (let row = 0; row < 4; row++) {
             const numInRow = (row * 2) + 1;
             for (let i = 0; i < numInRow; i++) {
-                const x = (GRID_SIZE / 2) + (i - (numInRow-1)/2) * (size/2);
-                const y = startY + (row * h) + (h/2);
-                const pixel = hCtx.getImageData(x, y, 1, 1).data;
-                const brightness = (pixel[0] + pixel[1] + pixel[2]) / 3;
-                bits.push(brightness < 127 ? 1 : 0); // 1 = Dark/Chalk
+                const x = 150 + (i - row) * (size / 2);
+                const y = startY + (row * h) + (h / 2);
+                const pix = hCtx.getImageData(x, y, 1, 1).data;
+                const brightness = (pix[0] + pix[1] + pix[2]) / 3;
+                bits.push(brightness < 120 ? 1 : 0);
             }
         }
         return bits;
     }
 
-    function validateID(bits) {
-        // Structure mapping
+    function validateSigil(bits) {
+        // Data bits: [1, 3, 4, 5, 7, 8, 11, 12, 13]
+        // Parity bits: [2, 6, 10, 14]
         const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
         const S_Read = [bits[2], bits[6], bits[10], bits[14]];
         
-        // Parity Check
+        // XOR Parity Check
         const S_Calc = [
-            D[0] ^ D[1] ^ D[3] ^ D[4] ^ D[6] ^ D[8],
-            D[2] ^ D[3] ^ D[4] ^ D[5] ^ D[7] ^ D[8],
-            D[0] ^ D[2] ^ D[3] ^ D[6] ^ D[7],
-            D[1] ^ D[4] ^ D[5] ^ D[7] ^ D[8]
+            D[0]^D[1]^D[3]^D[4]^D[6]^D[8],
+            D[2]^D[3]^D[4]^D[5]^D[7]^D[8],
+            D[0]^D[2]^D[3]^D[6]^D[7],
+            D[1]^D[4]^D[5]^D[7]^D[8]
         ];
 
-        const isValid = S_Read.every((v, i) => v === S_Calc[i]);
-        if (isValid && bits[0] === 1 && bits[9] === 1) { // Check anchors
+        if (S_Read.every((v, i) => v === S_Calc[i])) {
             const id = parseInt(D.join(''), 2);
-            showResult(id, bits);
+            resultDisplay.textContent = id.toString().padStart(3, '0');
+            statusLabel.textContent = "Sigil Verified";
+            statusBox.classList.add('success');
+            drawReconstruction(bits);
         }
     }
 
-    function showResult(id, bits) {
-        statusBox.classList.add('success');
-        resultDisplay.textContent = id.toString().padStart(3, '0');
-        label.textContent = "ID VERIFIED";
-        drawReconstruction(bits);
-    }
-
     function drawReconstruction(bits) {
-        // Visual "Result" view
-        rCtx.clearRect(0,0,120,110);
-        const s = 25;
-        const h = s * Math.sin(Math.PI / 3);
+        rCtx.clearRect(0,0,140,120);
+        const s = 30, h = s * Math.sin(Math.PI/3);
         let idx = 0;
         for (let row = 0; row < 4; row++) {
             for (let i = 0; i < (row*2+1); i++) {
-                const x = 60 + (i - row) * (s/2);
+                const x = 70 + (i - row) * (s/2);
                 const y = 10 + (row * h);
                 rCtx.beginPath();
-                if (i%2===0) { // Up
-                    rCtx.moveTo(x, y); rCtx.lineTo(x-s/2, y+h); rCtx.lineTo(x+s/2, y+h);
-                } else { // Down
-                    rCtx.moveTo(x-s/2, y); rCtx.lineTo(x+s/2, y); rCtx.lineTo(x, y+h);
-                }
+                if (i%2===0) { rCtx.moveTo(x,y); rCtx.lineTo(x-s/2,y+h); rCtx.lineTo(x+s/2,y+h); }
+                else { rCtx.moveTo(x-s/2,y); rCtx.lineTo(x+s/2,y); rCtx.lineTo(x,y+h); }
                 rCtx.fillStyle = bits[idx] ? "#0f0" : "transparent";
                 rCtx.fill();
-                rCtx.strokeStyle = "#444";
+                rCtx.strokeStyle = "#333";
                 rCtx.stroke();
                 idx++;
             }
         }
     }
 
-    function drawOutline(approx) {
+    function drawOverlayOutline(approx) {
+        const scaleX = window.innerWidth / GRID_SIZE;
+        const scaleY = window.innerHeight / GRID_SIZE;
         oCtx.strokeStyle = "#0f0";
-        oCtx.lineWidth = 3;
+        oCtx.lineWidth = 2;
         oCtx.beginPath();
-        oCtx.moveTo(approx.data32S[0], approx.data32S[1]);
-        oCtx.lineTo(approx.data32S[2], approx.data32S[3]);
-        oCtx.lineTo(approx.data32S[4], approx.data32S[5]);
+        oCtx.moveTo(approx.data32S[0]*scaleX, approx.data32S[1]*scaleY);
+        oCtx.lineTo(approx.data32S[2]*scaleX, approx.data32S[3]*scaleY);
+        oCtx.lineTo(approx.data32S[4]*scaleX, approx.data32S[5]*scaleY);
         oCtx.closePath();
         oCtx.stroke();
     }
-</script>
-<script>
-    // OpenCV Trigger
-    var Module = { onRuntimeInitialized: () => { window.onOpenCvReady(); } };
 </script>
 </body>
 </html>
