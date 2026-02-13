@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Robust v5</title>
-    <script src="opencv.js?v=20260213" defer></script>
+    <title>Sigil Scanner - Convex Hull v6</title>
+    <script src="opencv.js?v=20260214" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
         #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; }
@@ -32,7 +32,7 @@
 
     <div id="hud">
         <div class="status-box" id="statusBox">
-            <div class="label" id="statusLabel">Scanning...</div>
+            <div class="label" id="statusLabel">Searching...</div>
             <div id="result">---</div>
         </div>
     </div>
@@ -58,21 +58,19 @@
     var Module = {
         onRuntimeInitialized: () => { 
             cvReady = true; 
-            console.info("OpenCV.js Initialized");
+            console.log("CV System Online - PobleSec Ready");
             startCamera();
         }
     };
 
     async function startCamera() {
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-            video.srcObject = stream;
-            video.onloadedmetadata = () => {
-                overlay.width = window.innerWidth;
-                overlay.height = window.innerHeight;
-                requestAnimationFrame(loop);
-            };
-        } catch(e) { console.error("Camera access denied"); }
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        video.srcObject = stream;
+        video.onloadedmetadata = () => {
+            overlay.width = window.innerWidth;
+            overlay.height = window.innerHeight;
+            requestAnimationFrame(loop);
+        };
     }
 
     function loop() {
@@ -91,52 +89,56 @@
         let blurred = new cv.Mat();
         
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-
-        // PRE-PROCESSING: Blur internal details
-        let ksize = new cv.Size(7, 7);
-        cv.GaussianBlur(gray, blurred, ksize, 0, 0, cv.BORDER_DEFAULT);
-
-        // THRESHOLD: Adaptive helps in shadows
+        cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
         cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
-
-        // MORPHOLOGY: Close gaps in the outer triangle line
-        let M_morph = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
-        cv.morphologyEx(binary, binary, cv.MORPH_CLOSE, M_morph);
 
         let contours = new cv.MatVector();
         let hierarchy = new cv.Mat();
         cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        let validThisFrame = false;
+        let foundLargest = false;
 
-        for (let i = 0; i < contours.size(); ++i) {
-            let cnt = contours.get(i);
-            let area = cv.contourArea(cnt);
-            
-            // Filter by size: not too small, not the whole screen
-            if (area > 2000 && area < 85000) { 
+        if (contours.size() > 0) {
+            let maxArea = 0;
+            let maxIdx = -1;
+            for (let i = 0; i < contours.size(); ++i) {
+                let area = cv.contourArea(contours.get(i));
+                if (area > maxArea) {
+                    maxArea = area;
+                    maxIdx = i;
+                }
+            }
+
+            if (maxIdx !== -1 && maxArea > 2500) {
+                let cnt = contours.get(maxIdx);
+                let hull = new cv.Mat();
+                // 1. Convex Hull: Ignore internal noise
+                cv.convexHull(cnt, hull, false, true);
+
                 let approx = new cv.Mat();
-                let peri = cv.arcLength(cnt, true);
-                // epsilon 0.08: High tolerance for hand-drawn shapes
-                cv.approxPolyDP(cnt, approx, 0.08 * peri, true);
+                let peri = cv.arcLength(hull, true);
+                // 2. Approximate Triangle: High epsilon for messy chalk
+                cv.approxPolyDP(hull, approx, 0.08 * peri, true);
 
                 if (approx.rows === 3) {
-                    drawLiveOutline(approx); // Visible wireframe
-                    if (warpAndDecode(src, approx)) validThisFrame = true;
+                    drawLiveOutline(approx); // Searching lines visible
+                    if (warpAndDecode(src, approx)) foundLargest = true;
+                } else {
+                    if (Math.random() > 0.99) console.debug(`Hull points: ${approx.rows}`);
                 }
+                hull.delete();
                 approx.delete();
             }
-            cnt.delete();
         }
 
-        if (!validThisFrame) {
+        if (!foundLargest) {
             idMatchCount = 0;
             statusBox.classList.remove('success');
-            statusLabel.textContent = "Scanning...";
+            statusLabel.textContent = "Searching...";
         }
 
         src.delete(); gray.delete(); binary.delete(); blurred.delete(); 
-        contours.delete(); hierarchy.delete(); M_morph.delete();
+        contours.delete(); hierarchy.delete();
     }
 
     function warpAndDecode(src, approx) {
@@ -146,7 +148,6 @@
         let apex = pts[0], base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
         let bl = base[0], br = base[1];
 
-        // Normalizing the perspective
         let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
         let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 40, 40, 260, 260, 260]);
         let M = cv.getAffineTransform(srcPts, dstPts);
@@ -157,11 +158,10 @@
         const bits = sampleWarpedGrid();
         
         let success = false;
-        // Verify Anchors
-        if (bits[0] === 1 && bits[9] === 1) {
+        if (bits[0] === 1 && bits[9] === 1) { // Anchor checks
             success = validateSigil(bits);
         } else {
-            if (Math.random() > 0.98) console.debug("Anchor Check Failed");
+            if (Math.random() > 0.95) console.warn("Orientation/Anchor fail");
         }
 
         warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
@@ -170,9 +170,7 @@
 
     function sampleWarpedGrid() {
         const bits = [];
-        const size = 220 / 4;
-        const h = size * Math.sin(Math.PI / 3);
-        const startY = 40;
+        const size = 220 / 4, h = size * Math.sin(Math.PI / 3), startY = 40;
         for (let row = 0; row < 4; row++) {
             const numInRow = (row * 2) + 1;
             for (let i = 0; i < numInRow; i++) {
@@ -180,7 +178,6 @@
                 const y = startY + (row * h) + (h / 2);
                 const pix = hCtx.getImageData(x, y, 1, 1).data;
                 const brightness = (pix[0] + pix[1] + pix[2]) / 3;
-                // Sampling threshold for dark sigil cells
                 bits.push(brightness < 115 ? 1 : 0);
             }
         }
@@ -204,7 +201,6 @@
                 lastDetectedId = currentId;
             }
 
-            // 3-hit stability rule
             if (idMatchCount >= REQUIRED_MATCHES) {
                 resultDisplay.textContent = currentId.toString().padStart(3, '0');
                 statusLabel.textContent = "LOCKED";
@@ -213,6 +209,8 @@
                 if (idMatchCount === REQUIRED_MATCHES) navigator.vibrate(50);
                 return true;
             }
+        } else {
+            if (Math.random() > 0.98) console.debug("Parity Error");
         }
         return false;
     }
@@ -235,7 +233,7 @@
         const s = Math.min(overlay.width, overlay.height) * 0.45; 
         const h = s * Math.sin(Math.PI / 3);
         oCtx.save();
-        oCtx.globalAlpha = 0.5; // Request 50% opacity
+        oCtx.globalAlpha = 0.5;
         oCtx.translate(centerX, centerY - h/2);
         let idx = 0;
         const cellSize = s / 4, cellH = cellSize * Math.sin(Math.PI / 3);
@@ -250,7 +248,6 @@
                 }
                 oCtx.fillStyle = bits[idx] ? "#0f0" : "rgba(0,0,0,0.1)";
                 oCtx.fill();
-                oCtx.strokeStyle = "rgba(0,255,0,0.2)";
                 oCtx.stroke();
                 idx++;
             }
