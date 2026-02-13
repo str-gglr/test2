@@ -3,24 +3,24 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Calibrated</title>
+    <title>Sigil Scanner - Perspective Stable</title>
     <script src="opencv.js?v=20260214" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
         #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; max-height: 500px; border: 1px solid #333; }
-        /* Force Grayscale and contrast at the browser level */
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1) contrast(1.2); opacity: 0.7; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.6; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
-        #gate { position: absolute; z-index: 100; width: 100%; height: 100%; background: rgba(0,0,0,0.9); display: flex; align-items: center; justify-content: center; cursor: pointer; }
+        #gate { position: absolute; z-index: 100; width: 100%; height: 100%; background: rgba(0,0,0,0.95); display: flex; align-items: center; justify-content: center; cursor: pointer; letter-spacing: 3px; font-weight: bold; }
         #hud { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; z-index: 10; }
-        .status-box { background: rgba(10,10,10,0.8); border: 1px solid #444; border-radius: 8px; padding: 10px 20px; text-align: center; min-width: 120px; }
-        #result { font-size: 1.8rem; font-weight: bold; color: #555; }
-        .success #result { color: #0f0; text-shadow: 0 0 10px #0f0; }
+        .status-box { background: rgba(10,10,10,0.9); border: 2px solid #222; border-radius: 12px; padding: 12px 24px; text-align: center; min-width: 140px; }
+        #result { font-size: 2rem; font-weight: bold; color: #444; }
+        .success #result { color: #0f0; text-shadow: 0 0 15px #0f0; }
+        .success { border-color: #0f0; }
     </style>
 </head>
 <body>
 
-    <div id="gate" onclick="initSystem()">START 3-FPS SCANNER</div>
+    <div id="gate" onclick="initSystem()">INITIALIZE 3FPS SCANNER</div>
 
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
@@ -57,7 +57,7 @@
     var Module = { onRuntimeInitialized: () => { cvReady = true; } };
 
     async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", frameRate: { ideal: 10, max: 15 } } });
         video.srcObject = stream;
         video.onloadedmetadata = () => {
             overlay.width = overlay.height = camContainer.clientWidth;
@@ -91,7 +91,7 @@
         let contours = new cv.MatVector(), hierarchy = new cv.Mat();
         cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        let valid = false;
+        let foundValid = false;
         if (contours.size() > 0) {
             let maxA = 0, maxI = -1;
             for (let i = 0; i < contours.size(); ++i) {
@@ -99,26 +99,29 @@
                 if (a > maxA) { maxA = a; maxI = i; }
             }
 
-            if (maxI !== -1 && maxA > 5000) {
+            if (maxI !== -1 && maxA > 4000) {
                 let cnt = contours.get(maxI);
                 let hull = new cv.Mat(), approx = new cv.Mat();
                 cv.convexHull(cnt, hull, false, true);
                 cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
                 if (approx.rows === 3) {
-                    const decode = warpAndDecode(src, approx);
-                    drawWireframe(approx); // Draw the reconstructed wireframe
+                    const corners = getSortedCorners(approx);
+                    drawWireframe(corners); // Real-time perspective reconstruction
+                    
+                    const decode = warpAndDecode(src, corners);
                     if (decode.success) {
                         resultDisplay.textContent = decode.id.toString().padStart(3, '0');
                         statusBox.classList.add('success');
-                        valid = true;
+                        foundValid = true;
+                        navigator.vibrate(50);
                     }
                 }
                 hull.delete(); approx.delete();
             }
         }
 
-        if (!valid) {
+        if (!foundValid) {
             statusBox.classList.remove('success');
             resultDisplay.textContent = "---";
         }
@@ -126,36 +129,40 @@
         src.delete(); gray.delete(); binary.delete(); blurred.delete(); contours.delete(); hierarchy.delete();
     }
 
-    function warpAndDecode(src, approx) {
+    function getSortedCorners(approx) {
         let pts = [];
         for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
         pts.sort((a, b) => a.y - b.y);
-        let apex = pts[0], base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        const apex = pts[0];
+        const base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        return { apex, bl: base[0], br: base[1] };
+    }
 
-        let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, base[0].x, base[0].y, base[1].x, base[1].y]);
-        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [200, 70, 75, 330, 325, 330]);
+    function warpAndDecode(src, corners) {
+        let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [corners.apex.x, corners.apex.y, corners.bl.x, corners.bl.y, corners.br.x, corners.br.y]);
+        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [200, 70, 80, 330, 320, 330]);
         let M = cv.getAffineTransform(srcPts, dstPts);
         let warped = new cv.Mat();
         cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
         cv.imshow(hCanvas, warped); 
 
-        // Comparative Sampling
-        const blackRef = (getLum(200, 85) + getLum(90, 315)) / 2;
-        const whiteRef = getLum(310, 315);
-        const midPoint = (blackRef + whiteRef) / 2;
+        // Anchor Sampling for Normalization
+        const blackPoint = (getAreaLum(200, 85) + getAreaLum(95, 315)) / 2;
+        const whitePoint = getAreaLum(305, 315);
+        const threshold = (blackPoint + whitePoint) / 2;
 
         const bits = [];
-        const s = 250 / 4, h = s * Math.sin(Math.PI / 3), startY = 75;
+        const s = 240 / 4, h = s * Math.sin(Math.PI / 3), startY = 75;
         for (let row = 0; row < 4; row++) {
             for (let i = 0; i < (row * 2 + 1); i++) {
                 const x = 200 + (i - row) * (s / 2);
                 const y = startY + (row * h) + (h / 2);
-                bits.push(getLum(x, y) < midPoint ? 1 : 0);
+                bits.push(getAreaLum(x, y) < threshold ? 1 : 0);
             }
         }
 
         let success = false, id = null;
-        if (bits[0] === 1 && bits[9] === 1) { // Anchors must be black
+        if (bits[0] === 1 && bits[9] === 1) { 
             const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
             const S_R = [bits[2], bits[6], bits[10], bits[14]];
             const S_C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
@@ -170,38 +177,40 @@
         return { success, id };
     }
 
-    function getLum(x, y) {
-        const p = hCtx.getImageData(x, y, 1, 1).data;
-        return (p[0] + p[1] + p[2]) / 3;
+    function getAreaLum(x, y) {
+        // Evaluate 3x3 block for better stability
+        const p = hCtx.getImageData(x-1, y-1, 3, 3).data;
+        let sum = 0;
+        for (let i = 0; i < p.length; i += 4) sum += (p[i] + p[i+1] + p[i+2]) / 3;
+        return sum / 9;
     }
 
-    function drawWireframe(approx) {
+    function drawWireframe(c) {
         const scale = overlay.width / GRID_SIZE;
-        let pts = [];
-        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2]*scale, y: approx.data32S[i*2+1]*scale});
-        pts.sort((a, b) => a.y - b.y);
-        const apex = pts[0], bl = pts[1].x < pts[2].x ? pts[1] : pts[2], br = pts[1].x < pts[2].x ? pts[2] : pts[1];
+        oCtx.strokeStyle = "rgba(0, 255, 0, 0.7)";
+        oCtx.lineWidth = 2;
 
-        oCtx.strokeStyle = "rgba(0, 255, 0, 0.6)";
-        oCtx.lineWidth = 1.5;
+        for (let row = 0; row <= 4; row++) {
+            const t = row / 4;
+            // Horizontal lines
+            const L = { x: c.apex.x + (c.bl.x - c.apex.x)*t, y: c.apex.y + (c.bl.y - c.apex.y)*t };
+            const R = { x: c.apex.x + (c.br.x - c.apex.x)*t, y: c.apex.y + (c.br.y - c.apex.y)*t };
+            oCtx.beginPath();
+            oCtx.moveTo(L.x*scale, L.y*scale);
+            oCtx.lineTo(R.x*scale, R.y*scale);
+            oCtx.stroke();
 
-        // Draw the 16 sub-triangles
-        for (let row = 0; row < 4; row++) {
-            const yStart = apex.y + (row * (bl.y - apex.y) / 4);
-            const yEnd = apex.y + ((row + 1) * (bl.y - apex.y) / 4);
-            
-            for (let i = 0; i <= row; i++) {
-                const xTop = apex.x + (i - row/2) * ((br.x - bl.x)/4);
-                const xBotL = apex.x + (i - (row+1)/2) * ((br.x - bl.x)/4);
-                const xBotR = apex.x + (i+1 - (row+1)/2) * ((br.x - bl.x)/4);
+            // Downward diagonal lines
+            oCtx.beginPath();
+            oCtx.moveTo( (c.apex.x + (c.br.x - c.apex.x)*t)*scale, (c.apex.y + (c.br.y - c.apex.y)*t)*scale );
+            oCtx.lineTo( (c.bl.x + (c.br.x - c.bl.x)*t)*scale, (c.bl.y + (c.br.y - c.bl.y)*t)*scale );
+            oCtx.stroke();
 
-                oCtx.beginPath();
-                oCtx.moveTo(xTop, yStart);
-                oCtx.lineTo(xBotL, yEnd);
-                oCtx.lineTo(xBotR, yEnd);
-                oCtx.closePath();
-                oCtx.stroke();
-            }
+            // Upward diagonal lines
+            oCtx.beginPath();
+            oCtx.moveTo( (c.apex.x + (c.bl.x - c.apex.x)*t)*scale, (c.apex.y + (c.bl.y - c.apex.y)*t)*scale );
+            oCtx.lineTo( (c.br.x + (c.bl.x - c.br.x)*t)*scale, (c.br.y + (c.bl.y - c.br.y)*t)*scale );
+            oCtx.stroke();
         }
     }
 </script>
