@@ -3,24 +3,24 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner v2 - PobleSec Edition</title>
+    <title>Sigil Scanner - Stability v3</title>
     <script src="opencv.js?v=20260213" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
-        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; overflow: hidden; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.6; }
+        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.7; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
         
-        #hud { position: absolute; bottom: 30px; width: 100%; display: flex; justify-content: center; z-index: 10; }
+        #hud { position: absolute; bottom: 40px; width: 100%; display: flex; justify-content: center; z-index: 10; }
         .status-box { 
-            background: rgba(15,15,15,0.95); border: 1px solid #333; border-radius: 12px; 
-            padding: 20px; text-align: center; min-width: 240px; backdrop-filter: blur(10px);
-            display: flex; flex-direction: column; align-items: center; gap: 10px;
+            background: rgba(10,10,10,0.9); border: 1px solid #333; border-radius: 12px; 
+            padding: 15px 30px; text-align: center; backdrop-filter: blur(10px);
+            display: flex; flex-direction: column; align-items: center;
         }
-        #reconCanvas { width: 140px; height: 120px; background: #050505; border-radius: 4px; border: 1px solid #222; }
-        #result { font-size: 2.2rem; font-weight: bold; color: #0f0; text-shadow: 0 0 10px #0f0; margin: 5px 0; }
-        .label { font-size: 0.7rem; letter-spacing: 2px; color: #888; text-transform: uppercase; }
-        .success { border-color: #0f0 !important; box-shadow: 0 0 15px rgba(0,255,0,0.2); }
+        #result { font-size: 2.5rem; font-weight: bold; color: #444; margin: 5px 0; transition: color 0.3s; }
+        .label { font-size: 0.7rem; letter-spacing: 2px; color: #666; text-transform: uppercase; }
+        .success #result { color: #0f0; text-shadow: 0 0 15px rgba(0,255,0,0.6); }
+        .success { border-color: #0f0; }
     </style>
 </head>
 <body>
@@ -32,10 +32,8 @@
 
     <div id="hud">
         <div class="status-box" id="statusBox">
-            <div class="label" id="statusLabel">Initializing CV...</div>
+            <div class="label" id="statusLabel">Scanning Pavement...</div>
             <div id="result">---</div>
-            <canvas id="reconCanvas"></canvas>
-            <div class="label" style="margin-top:5px">Decoded Sigil View</div>
         </div>
     </div>
 
@@ -43,42 +41,38 @@
     const video = document.getElementById('video');
     const overlay = document.getElementById('overlay');
     const oCtx = overlay.getContext('2d');
-    const reconCanvas = document.getElementById('reconCanvas');
-    const rCtx = reconCanvas.getContext('2d');
     const statusBox = document.getElementById('statusBox');
     const resultDisplay = document.getElementById('result');
     const statusLabel = document.getElementById('statusLabel');
 
     let cvReady = false;
+    let lastDetectedId = null;
+    let idMatchCount = 0;
+    const REQUIRED_MATCHES = 3; // 3-hit rule for error correction
+
     const GRID_SIZE = 300;
-    const hCanvas = document.createElement('canvas'); // Hidden canvas for warping
+    const hCanvas = document.createElement('canvas');
     hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d', { willReadFrequently: true });
 
-    // Handle OpenCV Initialization
     var Module = {
         onRuntimeInitialized: () => { 
             cvReady = true; 
-            statusLabel.textContent = "Seeking Sigil...";
+            statusLabel.textContent = "System Ready";
             startCamera();
         }
     };
 
     async function startCamera() {
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ 
-                video: { facingMode: "environment", focusMode: "continuous" } 
-            });
-            video.srcObject = stream;
-            video.onloadedmetadata = () => {
-                overlay.width = window.innerWidth;
-                overlay.height = window.innerHeight;
-                requestAnimationFrame(loop);
-            };
-        } catch (err) {
-            statusLabel.textContent = "Camera Error";
-            console.error(err);
-        }
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: "environment" } 
+        });
+        video.srcObject = stream;
+        video.onloadedmetadata = () => {
+            overlay.width = window.innerWidth;
+            overlay.height = window.innerHeight;
+            requestAnimationFrame(loop);
+        };
     }
 
     function loop() {
@@ -90,48 +84,48 @@
     }
 
     function processFrame() {
-        // Draw video frame to hidden canvas for OpenCV to read
         hCtx.drawImage(video, 0, 0, GRID_SIZE, GRID_SIZE);
         let src = cv.imread(hCanvas);
         let gray = new cv.Mat();
         let binary = new cv.Mat();
         
-        // Step 1: Adaptive Threshold for street lighting
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
         cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 4);
-
-        // Step 2: Dilation to repair chalk line gaps
-        let M_dilate = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-        cv.dilate(binary, binary, M_dilate);
 
         let contours = new cv.MatVector();
         let hierarchy = new cv.Mat();
         cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
+        let foundValidSigil = false;
+
         for (let i = 0; i < contours.size(); ++i) {
             let cnt = contours.get(i);
-            if (cv.contourArea(cnt) > 2500) {
+            if (cv.contourArea(cnt) > 3000) {
                 let approx = new cv.Mat();
                 cv.approxPolyDP(cnt, approx, 0.05 * cv.arcLength(cnt, true), true);
 
-                if (approx.rows === 3) { // Big Triangle Found
-                    warpAndDecode(src, approx);
-                    drawOverlayOutline(approx);
+                if (approx.rows === 3) {
+                    if (warpAndDecode(src, approx)) foundValidSigil = true;
                 }
                 approx.delete();
             }
             cnt.delete();
         }
-        src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete(); M_dilate.delete();
+
+        if (!foundValidSigil) {
+            idMatchCount = 0;
+            statusBox.classList.remove('success');
+            statusLabel.textContent = "Scanning Pavement...";
+        }
+
+        src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete();
     }
 
     function warpAndDecode(src, approx) {
-        // Step 3: Perspective Normalization (Warping)
         let pts = [];
         for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
-        pts.sort((a, b) => a.y - b.y); // Rough Apex finding
-        let apex = pts[0];
-        let base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        pts.sort((a, b) => a.y - b.y);
+        let apex = pts[0], base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
         let bl = base[0], br = base[1];
 
         let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
@@ -140,25 +134,24 @@
         let warped = new cv.Mat();
         cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
 
-        // Step 4: Divide and Sample Matrix
         cv.imshow(hCanvas, warped);
         const bits = sampleWarpedGrid();
         
-        // Step 5: Anchors & Logic Verification
-        // Bit 0 = Apex Anchor, Bit 9 = Left Anchor
+        let valid = false;
+        // Check Anchors (Top and Bottom-Left must be black/1)
         if (bits[0] === 1 && bits[9] === 1) {
-            validateSigil(bits);
+            valid = validateSigil(bits);
         }
 
         warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
+        return valid;
     }
 
     function sampleWarpedGrid() {
         const bits = [];
-        const size = 220 / 4; // Use usable triangle area
+        const size = 220 / 4;
         const h = size * Math.sin(Math.PI / 3);
         const startY = 40;
-        
         for (let row = 0; row < 4; row++) {
             const numInRow = (row * 2) + 1;
             for (let i = 0; i < numInRow; i++) {
@@ -173,59 +166,66 @@
     }
 
     function validateSigil(bits) {
-        // Data bits: [1, 3, 4, 5, 7, 8, 11, 12, 13]
-        // Parity bits: [2, 6, 10, 14]
         const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
         const S_Read = [bits[2], bits[6], bits[10], bits[14]];
-        
-        // XOR Parity Check
         const S_Calc = [
-            D[0]^D[1]^D[3]^D[4]^D[6]^D[8],
-            D[2]^D[3]^D[4]^D[5]^D[7]^D[8],
-            D[0]^D[2]^D[3]^D[6]^D[7],
-            D[1]^D[4]^D[5]^D[7]^D[8]
+            D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8],
+            D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]
         ];
 
         if (S_Read.every((v, i) => v === S_Calc[i])) {
-            const id = parseInt(D.join(''), 2);
-            resultDisplay.textContent = id.toString().padStart(3, '0');
-            statusLabel.textContent = "Sigil Verified";
-            statusBox.classList.add('success');
-            drawReconstruction(bits);
+            const currentId = parseInt(D.join(''), 2);
+            if (currentId === lastDetectedId) {
+                idMatchCount++;
+            } else {
+                idMatchCount = 1;
+                lastDetectedId = currentId;
+            }
+
+            if (idMatchCount >= REQUIRED_MATCHES) {
+                resultDisplay.textContent = currentId.toString().padStart(3, '0');
+                statusLabel.textContent = "Sigil Locked";
+                statusBox.classList.add('success');
+                drawReconstructionOverlay(bits); // 50% opacity AR overlay
+                return true;
+            }
         }
+        return false;
     }
 
-    function drawReconstruction(bits) {
-        rCtx.clearRect(0,0,140,120);
-        const s = 30, h = s * Math.sin(Math.PI/3);
+    function drawReconstructionOverlay(bits) {
+        const centerX = overlay.width / 2;
+        const centerY = overlay.height / 2;
+        // Resolution-independent scale (40% of shortest screen side)
+        const s = Math.min(overlay.width, overlay.height) * 0.4; 
+        const h = s * Math.sin(Math.PI / 3);
+        
+        oCtx.save();
+        oCtx.globalAlpha = 0.5; // 50% opacity overlay
+        oCtx.translate(centerX, centerY - h/2);
+
         let idx = 0;
+        const cellSize = s / 4;
+        const cellH = cellSize * Math.sin(Math.PI / 3);
+
         for (let row = 0; row < 4; row++) {
-            for (let i = 0; i < (row*2+1); i++) {
-                const x = 70 + (i - row) * (s/2);
-                const y = 10 + (row * h);
-                rCtx.beginPath();
-                if (i%2===0) { rCtx.moveTo(x,y); rCtx.lineTo(x-s/2,y+h); rCtx.lineTo(x+s/2,y+h); }
-                else { rCtx.moveTo(x-s/2,y); rCtx.lineTo(x+s/2,y); rCtx.lineTo(x,y+h); }
-                rCtx.fillStyle = bits[idx] ? "#0f0" : "transparent";
-                rCtx.fill();
-                rCtx.strokeStyle = "#333";
-                rCtx.stroke();
+            for (let i = 0; i < (row * 2 + 1); i++) {
+                const tx = (i - row) * (cellSize / 2);
+                const ty = row * cellH;
+                oCtx.beginPath();
+                if (i % 2 === 0) {
+                    oCtx.moveTo(tx, ty); oCtx.lineTo(tx - cellSize/2, ty + cellH); oCtx.lineTo(tx + cellSize/2, ty + cellH);
+                } else {
+                    oCtx.moveTo(tx - cellSize/2, ty); oCtx.lineTo(tx + cellSize/2, ty); oCtx.lineTo(tx, ty + cellH);
+                }
+                oCtx.fillStyle = bits[idx] ? "#0f0" : "rgba(0,0,0,0.1)";
+                oCtx.fill();
+                oCtx.strokeStyle = "rgba(0,255,0,0.3)";
+                oCtx.stroke();
                 idx++;
             }
         }
-    }
-
-    function drawOverlayOutline(approx) {
-        const scaleX = window.innerWidth / GRID_SIZE;
-        const scaleY = window.innerHeight / GRID_SIZE;
-        oCtx.strokeStyle = "#0f0";
-        oCtx.lineWidth = 2;
-        oCtx.beginPath();
-        oCtx.moveTo(approx.data32S[0]*scaleX, approx.data32S[1]*scaleY);
-        oCtx.lineTo(approx.data32S[2]*scaleX, approx.data32S[3]*scaleY);
-        oCtx.lineTo(approx.data32S[4]*scaleX, approx.data32S[5]*scaleY);
-        oCtx.closePath();
-        oCtx.stroke();
+        oCtx.restore();
     }
 </script>
 </body>
