@@ -3,39 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner</title>
-    <link rel="manifest" href="manifest.json">
+    <title>Sigil Scanner v2</title>
+    <script src="https://docs.opencv.org/4.8.0/opencv.js" async></script>
     <style>
-        body { margin: 0; background: #000; overflow: hidden; font-family: monospace; display: flex; flex-direction: column; height: 100vh; }
+        body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.5; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
         
-        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; overflow: hidden; }
-        video { position: absolute; min-width: 100%; min-height: 100%; object-fit: cover; opacity: 0.6; }
-        canvas { position: absolute; top: 0; left: 0; }
-        
-        #hud {
-            position: absolute; bottom: 40px; left: 0; width: 100%; 
-            display: flex; justify-content: center; pointer-events: none;
-            z-index: 20;
-        }
-
-        .status-box {
-            background: rgba(20, 20, 20, 0.9);
-            border: 1px solid #555;
-            border-radius: 12px;
-            padding: 20px 30px;
-            text-align: center;
-            min-width: 220px;
-            backdrop-filter: blur(8px);
-            transition: all 0.2s ease;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-        }
-
-        #label { color: #aaa; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px; }
-        #result { color: #fff; font-size: 2.5rem; font-weight: bold; letter-spacing: 1px; font-family: sans-serif; }
-        
-        .success { border-color: #0f0 !important; background: rgba(0, 30, 0, 0.9); }
-        .success #result { color: #0f0 !important; text-shadow: 0 0 15px #0f0; }
-        .success #label { color: #4f4; }
+        #hud { position: absolute; bottom: 20px; width: 100%; display: flex; flex-direction: column; align-items: center; gap: 15px; z-index: 10; }
+        .status-box { background: rgba(20,20,20,0.9); border: 1px solid #444; border-radius: 12px; padding: 15px; text-align: center; min-width: 200px; backdrop-filter: blur(5px); }
+        #reconCanvas { width: 120px; height: 110px; background: #111; border-radius: 8px; border: 1px solid #333; margin-top: 10px; }
+        #result { font-size: 2rem; font-weight: bold; margin: 5px 0; }
+        .success { border-color: #0f0; color: #0f0; }
     </style>
 </head>
 <body>
@@ -47,213 +27,195 @@
 
     <div id="hud">
         <div class="status-box" id="statusBox">
-            <div id="label">Align Circles with Triangles</div>
-            <div id="result">Scanning...</div>
+            <div style="font-size: 0.7rem; letter-spacing: 1px;">SYSTEM STATUS: <span id="label">INITIALIZING CV...</span></div>
+            <div id="result">---</div>
+            <canvas id="reconCanvas"></canvas>
         </div>
     </div>
 
 <script>
     const video = document.getElementById('video');
-    const canvas = document.getElementById('overlay');
-    const ctx = canvas.getContext('2d');
-    const resultDisplay = document.getElementById('result');
-    const statusLabel = document.getElementById('label');
+    const overlay = document.getElementById('overlay');
+    const oCtx = overlay.getContext('2d');
+    const reconCanvas = document.getElementById('reconCanvas');
+    const rCtx = reconCanvas.getContext('2d');
     const statusBox = document.getElementById('statusBox');
+    const resultDisplay = document.getElementById('result');
+    const label = document.getElementById('label');
 
-    // CONFIGURATION
-    const GRID_SIZE = 300; 
-    const SAMPLE_RADIUS = 6; // Radius of pixels to average (makes it robust for hand drawing)
-    
-    // MAPPING (Based on your prompt)
-    // Physical Grid Index (0-15) mapped to Logical Role
-    // 0: Anchor(B), 1:D1, 2:S1, 3:D2, 4:D3, 5:D4, 6:S2, 7:D5, 8:D6
-    // 9: Anchor(B), 10:S3, 11:D7, 12:D8, 13:D9, 14:S4, 15: Anchor(W)
-    
-    // Rotation permutations
-    const ROTATION_MAPS = [
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], // 0°
-        [15, 8, 7, 13, 3, 14, 6, 12, 11, 0, 5, 1, 2, 4, 10, 9], // 120°
-        [9, 11, 12, 4, 13, 10, 6, 2, 1, 15, 14, 8, 7, 3, 5, 0]  // 240°
+    let cvReady = false;
+    const GRID_SIZE = 300;
+    const hCanvas = document.createElement('canvas');
+    hCanvas.width = hCanvas.height = GRID_SIZE;
+    const hCtx = hCanvas.getContext('2d', { willReadFrequently: true });
+
+    // Logical grid mapping
+    const GRID_MAP = [
+        "A1", "D1", "S1", "D2", "D3", "D4", "S2", "D5", "D6", "A2", "S3", "D7", "D8", "D9", "S4", "Z"
     ];
 
-    let stream = null;
-    let lastValidID = null;
-    const hiddenCanvas = document.createElement('canvas');
-    const hCtx = hiddenCanvas.getContext('2d', { willReadFrequently: true });
+    window.onOpenCvReady = () => { 
+        cvReady = true; 
+        label.textContent = "SEEKING SIGIL";
+        startCamera();
+    };
 
     async function startCamera() {
-        try {
-            stream = await navigator.mediaDevices.getUserMedia({ 
-                video: { facingMode: { exact: "environment" } } 
-            }).catch(() => navigator.mediaDevices.getUserMedia({ video: true }));
-
-            video.srcObject = stream;
-            video.onloadedmetadata = () => {
-                resize();
-                requestAnimationFrame(loop);
-            };
-        } catch (err) {
-            resultDisplay.textContent = "Camera Error";
-        }
-    }
-
-    function resize() {
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
-        hiddenCanvas.width = window.innerWidth;
-        hiddenCanvas.height = window.innerHeight;
-    }
-    window.addEventListener('resize', resize);
-
-    function getPoints(cx, cy) {
-        const size = GRID_SIZE / 4; 
-        const h = size * Math.sin(Math.PI / 3);
-        const startY = cy - (1.5 * h); // Centered vertically
-        
-        let points = [];
-        for (let row = 0; row < 4; row++) {
-            const numInRow = (row * 2) + 1;
-            for (let i = 0; i < numInRow; i++) {
-                const centerOffsetIndex = i - ((numInRow - 1) / 2);
-                const x = cx + (centerOffsetIndex * (size / 2));
-                const y = startY + (row * h) + (h/2); // Center of triangle
-                points.push({x, y});
-            }
-        }
-        return points;
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        video.srcObject = stream;
+        video.onloadedmetadata = () => {
+            overlay.width = window.innerWidth;
+            overlay.height = window.innerHeight;
+            requestAnimationFrame(loop);
+        };
     }
 
     function loop() {
-        if (video.readyState === video.HAVE_ENOUGH_DATA) {
-            // 1. Draw UI
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            const cx = canvas.width / 2;
-            const cy = canvas.height / 2;
-            const points = getPoints(cx, cy);
-
-            const color = statusBox.classList.contains('success') ? '#00ff00' : 'rgba(255, 255, 255, 0.6)';
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 2;
-
-            points.forEach((p, i) => {
-                // Draw Sampling Circles (More forgiving than triangles)
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, 10, 0, Math.PI*2); // Visual target
-                ctx.stroke();
-                
-                // Draw subtle connections
-                if (i === 0 || i === 9 || i === 15) {
-                    // Highlight Anchors
-                    ctx.fillStyle = color;
-                    ctx.fill();
-                }
-            });
-
-            // 2. Scan Logic
-            scan(points);
+        if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
+            oCtx.clearRect(0, 0, overlay.width, overlay.height);
+            processFrame();
         }
         requestAnimationFrame(loop);
     }
 
-    function scan(points) {
-        hCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        
-        // 1. Average Brightness Sampling (Robust to noise)
-        const readings = points.map(p => {
-            const imgData = hCtx.getImageData(p.x - SAMPLE_RADIUS, p.y - SAMPLE_RADIUS, SAMPLE_RADIUS*2, SAMPLE_RADIUS*2);
-            let total = 0;
-            const count = imgData.data.length / 4;
-            for (let i = 0; i < imgData.data.length; i += 4) {
-                // Greyscale: 0.3R + 0.59G + 0.11B
-                total += (imgData.data[i]*0.299 + imgData.data[i+1]*0.587 + imgData.data[i+2]*0.114);
+    function processFrame() {
+        let src = cv.imread(video);
+        let gray = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+        cv.threshold(gray, gray, 100, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+        cv.findContours(gray, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        for (let i = 0; i < contours.size(); ++i) {
+            let cnt = contours.get(i);
+            let area = cv.contourArea(cnt);
+            if (area > 5000) {
+                let peri = cv.arcLength(cnt, true);
+                let approx = new cv.Mat();
+                cv.approxPolyDP(cnt, approx, 0.04 * peri, true);
+
+                if (approx.rows === 3) { // Found a triangle!
+                    warpAndDecode(src, approx);
+                    drawOutline(approx);
+                }
+                approx.delete();
             }
-            return total / count;
-        });
+            cnt.delete();
+        }
+        src.delete(); gray.delete(); contours.delete(); hierarchy.delete();
+    }
 
-        // 2. Dynamic Thresholding
-        // We find the darkest dark and brightest bright in the sample set
-        let minVal = 255, maxVal = 0;
-        readings.forEach(r => {
-            if (r < minVal) minVal = r;
-            if (r > maxVal) maxVal = r;
-        });
+    function warpAndDecode(src, approx) {
+        // 1. Sort points (Apex, BL, BR) for Affine Warp
+        let pts = [];
+        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
+        pts.sort((a, b) => a.y - b.y); // Apex is highest y
+        let apex = pts[0];
+        let base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        let bl = base[0], br = base[1];
 
-        // If image is too low contrast (e.g. darkness or blank paper), skip
-        if ((maxVal - minVal) < 40) return resetUI();
+        // 2. Map to standard 300x300 grid
+        let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
+        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 20, 20, 280, 280, 280]);
+        let M = cv.getAffineTransform(srcPts, dstPts);
+        let warped = new cv.Mat();
+        cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
 
-        const threshold = (minVal + maxVal) / 2;
-        // 1 = Dark (Ink), 0 = Light (Paper)
-        const rawBits = readings.map(r => r < threshold ? 1 : 0);
+        // 3. Sample 16 Points
+        cv.imshow(hCanvas, warped);
+        const bits = sampleGrid();
+        validateID(bits);
 
-        // 3. Orientation Detection (Anchors: 0, 9, 15)
-        // We look for the pattern: Black, Black, White
-        let mapIndex = -1;
+        warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
+    }
+
+    function sampleGrid() {
+        const size = GRID_SIZE / 4;
+        const h = size * Math.sin(Math.PI / 3);
+        const startY = 20;
+        let bits = [];
         
-        // 0 Deg: Top(0)=1, BL(9)=1, BR(15)=0
-        if (rawBits[0]===1 && rawBits[9]===1 && rawBits[15]===0) mapIndex = 0;
-        // 120 Deg: Top(0)=0, BL(9)=1, BR(15)=1 (Visually rotated)
-        else if (rawBits[0]===0 && rawBits[9]===1 && rawBits[15]===1) mapIndex = 2;
-        // 240 Deg: Top(0)=1, BL(9)=0, BR(15)=1
-        else if (rawBits[0]===1 && rawBits[9]===0 && rawBits[15]===1) mapIndex = 1;
+        for (let row = 0; row < 4; row++) {
+            const numInRow = (row * 2) + 1;
+            for (let i = 0; i < numInRow; i++) {
+                const x = (GRID_SIZE / 2) + (i - (numInRow-1)/2) * (size/2);
+                const y = startY + (row * h) + (h/2);
+                const pixel = hCtx.getImageData(x, y, 1, 1).data;
+                const brightness = (pixel[0] + pixel[1] + pixel[2]) / 3;
+                bits.push(brightness < 127 ? 1 : 0); // 1 = Dark/Chalk
+            }
+        }
+        return bits;
+    }
 
-        if (mapIndex === -1) return resetUI();
-
-        // 4. Decode
-        const map = ROTATION_MAPS[mapIndex];
-        const bits = map.map(i => rawBits[i]);
-
-        // Map bits to Structure
-        // Row 2: D1(idx1), S1(idx2), D2(idx3)
-        // Row 3: D3(idx4), D4(idx5), S2(idx6), D5(idx7), D6(idx8)
-        // Row 4: ... D7(idx11), D8(idx12), D9(idx13), S4(idx14) ...
+    function validateID(bits) {
+        // Structure mapping
+        const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
+        const S_Read = [bits[2], bits[6], bits[10], bits[14]];
         
-        const D = [
-            bits[1], bits[3],         // D1, D2
-            bits[4], bits[5], bits[7], bits[8], // D3..D6
-            bits[11], bits[12], bits[13] // D7..D9
+        // Parity Check
+        const S_Calc = [
+            D[0] ^ D[1] ^ D[3] ^ D[4] ^ D[6] ^ D[8],
+            D[2] ^ D[3] ^ D[4] ^ D[5] ^ D[7] ^ D[8],
+            D[0] ^ D[2] ^ D[3] ^ D[6] ^ D[7],
+            D[1] ^ D[4] ^ D[5] ^ D[7] ^ D[8]
         ];
-        
-        const S_Read = { 
-            S1: bits[2], 
-            S2: bits[6], 
-            S3: bits[10], 
-            S4: bits[14] 
-        };
 
-        // 5. Parity Check
-        // S1 checks D1(0), D2(1), D4(3), D5(4), D7(6), D9(8)
-        const S1_Calc = D[0] ^ D[1] ^ D[3] ^ D[4] ^ D[6] ^ D[8];
-        const S2_Calc = D[2] ^ D[3] ^ D[4] ^ D[5] ^ D[7] ^ D[8];
-        const S3_Calc = D[0] ^ D[2] ^ D[3] ^ D[6] ^ D[7];
-        const S4_Calc = D[1] ^ D[4] ^ D[5] ^ D[7] ^ D[8];
-
-        if (S_Read.S1 === S1_Calc && S_Read.S2 === S2_Calc && 
-            S_Read.S3 === S3_Calc && S_Read.S4 === S4_Calc) {
-            
+        const isValid = S_Read.every((v, i) => v === S_Calc[i]);
+        if (isValid && bits[0] === 1 && bits[9] === 1) { // Check anchors
             const id = parseInt(D.join(''), 2);
-            showSuccess(id);
-        } else {
-            resetUI();
+            showResult(id, bits);
         }
     }
 
-    function showSuccess(id) {
-        if(lastValidID !== id && navigator.vibrate) navigator.vibrate(50);
-        lastValidID = id;
+    function showResult(id, bits) {
         statusBox.classList.add('success');
-        statusLabel.textContent = "ID DETECTED";
-        resultDisplay.textContent = id;
+        resultDisplay.textContent = id.toString().padStart(3, '0');
+        label.textContent = "ID VERIFIED";
+        drawReconstruction(bits);
     }
 
-    function resetUI() {
-        statusBox.classList.remove('success');
-        statusLabel.textContent = "Align Circles with Triangles";
-        if (!statusBox.classList.contains('success')) {
-           // We leave the last result or show 'Scanning...'
+    function drawReconstruction(bits) {
+        // Visual "Result" view
+        rCtx.clearRect(0,0,120,110);
+        const s = 25;
+        const h = s * Math.sin(Math.PI / 3);
+        let idx = 0;
+        for (let row = 0; row < 4; row++) {
+            for (let i = 0; i < (row*2+1); i++) {
+                const x = 60 + (i - row) * (s/2);
+                const y = 10 + (row * h);
+                rCtx.beginPath();
+                if (i%2===0) { // Up
+                    rCtx.moveTo(x, y); rCtx.lineTo(x-s/2, y+h); rCtx.lineTo(x+s/2, y+h);
+                } else { // Down
+                    rCtx.moveTo(x-s/2, y); rCtx.lineTo(x+s/2, y); rCtx.lineTo(x, y+h);
+                }
+                rCtx.fillStyle = bits[idx] ? "#0f0" : "transparent";
+                rCtx.fill();
+                rCtx.strokeStyle = "#444";
+                rCtx.stroke();
+                idx++;
+            }
         }
     }
 
-    startCamera();
+    function drawOutline(approx) {
+        oCtx.strokeStyle = "#0f0";
+        oCtx.lineWidth = 3;
+        oCtx.beginPath();
+        oCtx.moveTo(approx.data32S[0], approx.data32S[1]);
+        oCtx.lineTo(approx.data32S[2], approx.data32S[3]);
+        oCtx.lineTo(approx.data32S[4], approx.data32S[5]);
+        oCtx.closePath();
+        oCtx.stroke();
+    }
+</script>
+<script>
+    // OpenCV Trigger
+    var Module = { onRuntimeInitialized: () => { window.onOpenCvReady(); } };
 </script>
 </body>
 </html>
