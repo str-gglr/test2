@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Debug 1:1</title>
+    <title>Sigil Scanner - Precision 1:1</title>
     <script src="opencv.js?v=20260214" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
@@ -11,26 +11,19 @@
         video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.8; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
         #hud { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; z-index: 10; pointer-events: none; }
-        .status-box { 
-            background: rgba(10,10,10,0.5); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; 
-            padding: 10px 20px; text-align: center; backdrop-filter: blur(5px); width: 140px;
-        }
+        .status-box { background: rgba(10,10,10,0.8); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; padding: 10px 20px; text-align: center; width: 140px; }
         #result { font-size: 1.8rem; font-weight: bold; color: #444; margin: 2px 0; }
-        .label { font-size: 0.6rem; letter-spacing: 1px; color: #aaa; text-transform: uppercase; }
         .success #result { color: #0f0; text-shadow: 0 0 10px #0f0; }
-        .success { border-color: #0f0; background: rgba(0,40,0,0.4); }
+        .success { border-color: #0f0; }
     </style>
 </head>
 <body>
-
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
     </div>
-
     <div id="hud">
         <div class="status-box" id="statusBox">
-            <div class="label" id="statusLabel">Square Scan</div>
             <div id="result">---</div>
         </div>
     </div>
@@ -41,19 +34,16 @@
     const oCtx = overlay.getContext('2d');
     const statusBox = document.getElementById('statusBox');
     const resultDisplay = document.getElementById('result');
-    const statusLabel = document.getElementById('statusLabel');
 
     let cvReady = false;
     let lastDetectedId = null;
     let idMatchCount = 0;
-    const REQUIRED_MATCHES = 3;
-
-    const GRID_SIZE = 400; 
+    const GRID_SIZE = 400; // Increased for better sampling resolution
     const hCanvas = document.createElement('canvas');
     hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d', { willReadFrequently: true });
 
-    var Module = { onRuntimeInitialized: () => { cvReady = true; console.log("1:1 CV Ready. Checking bits..."); startCamera(); } };
+    var Module = { onRuntimeInitialized: () => { cvReady = true; startCamera(); } };
 
     async function startCamera() {
         const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
@@ -75,12 +65,10 @@
     function processFrame() {
         const vW = video.videoWidth, vH = video.videoHeight;
         const minD = Math.min(vW, vH);
-        const sx = (vW - minD) / 2, sy = (vH - minD) / 2;
-        hCtx.drawImage(video, sx, sy, minD, minD, 0, 0, GRID_SIZE, GRID_SIZE);
+        hCtx.drawImage(video, (vW-minD)/2, (vH-minD)/2, minD, minD, 0, 0, GRID_SIZE, GRID_SIZE);
 
         let src = cv.imread(hCanvas);
         let gray = new cv.Mat(), binary = new cv.Mat(), blurred = new cv.Mat();
-        
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
         cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
         cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
@@ -88,7 +76,6 @@
         let contours = new cv.MatVector(), hierarchy = new cv.Mat();
         cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        let found = false;
         if (contours.size() > 0) {
             let maxA = 0, maxI = -1;
             for (let i = 0; i < contours.size(); ++i) {
@@ -96,24 +83,18 @@
                 if (a > maxA) { maxA = a; maxI = i; }
             }
 
-            if (maxI !== -1 && maxA > 3000) {
+            if (maxI !== -1 && maxA > 4000) {
                 let cnt = contours.get(maxI);
                 let hull = new cv.Mat(), approx = new cv.Mat();
                 cv.convexHull(cnt, hull, false, true);
-                cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
+                cv.approxPolyDP(hull, approx, 0.07 * cv.arcLength(hull, true), true);
 
                 if (approx.rows === 3) {
-                    drawLiveOutline(approx);
-                    if (warpAndDecode(src, approx)) found = true;
+                    drawUI(approx);
+                    warpAndDecode(src, approx);
                 }
                 hull.delete(); approx.delete();
             }
-        }
-
-        if (!found) {
-            idMatchCount = 0;
-            statusBox.classList.remove('success');
-            statusLabel.textContent = "Searching...";
         }
         src.delete(); gray.delete(); binary.delete(); blurred.delete(); contours.delete(); hierarchy.delete();
     }
@@ -125,40 +106,35 @@
         let apex = pts[0], base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
 
         let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, base[0].x, base[0].y, base[1].x, base[1].y]);
-        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [200, 50, 50, 350, 350, 350]);
+        // Tighter transform: brings sampling points away from the messy chalk edges
+        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [200, 60, 65, 340, 335, 340]);
         let M = cv.getAffineTransform(srcPts, dstPts);
         let warped = new cv.Mat();
         cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
 
-        cv.imshow(hCanvas, warped); // Updates hidden canvas for sampling
+        cv.imshow(hCanvas, warped); 
         const bits = sampleGrid();
         
-        // DEBUG: See the raw bitstream in console
-        if (Math.random() > 0.9) console.log("Raw Bits Sampled:", bits.join(''));
-
-        let success = false;
-        // Anchor Check: Top Triangle (0) and Bottom-Left (9) MUST be black (1)
+        // Only run parity if both anchors (top and bottom-left) are 1
         if (bits[0] === 1 && bits[9] === 1) {
-            success = validateSigil(bits);
-        } else {
-            if (Math.random() > 0.9) console.warn(`Anchors failed: Top=${bits[0]}, B-Left=${bits[9]}`);
+            validateSigil(bits);
         }
 
         warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
-        return success;
     }
 
     function sampleGrid() {
         const bits = [];
-        const s = 300 / 4, h = s * Math.sin(Math.PI / 3), startY = 50;
+        const s = 270 / 4; // Adjusted scale for the tighter transform
+        const h = s * Math.sin(Math.PI / 3);
+        const startY = 60;
         for (let row = 0; row < 4; row++) {
             for (let i = 0; i < (row * 2 + 1); i++) {
                 const x = 200 + (i - row) * (s / 2);
                 const y = startY + (row * h) + (h / 2);
                 const pix = hCtx.getImageData(x, y, 1, 1).data;
                 const brightness = (pix[0] + pix[1] + pix[2]) / 3;
-                // Thresholding: Adjust 120 if your screen/chalk is too light/dark
-                bits.push(brightness < 120 ? 1 : 0);
+                bits.push(brightness < 130 ? 1 : 0);
             }
         }
         return bits;
@@ -173,58 +149,27 @@
         ];
 
         if (S_Read.every((v, i) => v === S_Calc[i])) {
-            const currentId = parseInt(D.join(''), 2);
-            if (currentId === lastDetectedId) idMatchCount++;
-            else { idMatchCount = 1; lastDetectedId = currentId; }
-
-            if (idMatchCount >= REQUIRED_MATCHES) {
-                resultDisplay.textContent = currentId.toString().padStart(3, '0');
-                statusLabel.textContent = "LOCKED";
-                statusBox.classList.add('success');
-                drawAR(bits);
-                if (idMatchCount === REQUIRED_MATCHES) {
-                    console.log(`%c ID DETECTED: ${currentId} `, 'background: #0f0; color: #000; font-weight: bold;');
-                    navigator.vibrate(50);
-                }
-                return true;
+            const id = parseInt(D.join(''), 2);
+            resultDisplay.textContent = id.toString().padStart(3, '0');
+            statusBox.classList.add('success');
+            if (id !== lastDetectedId) {
+                console.log("SAFE ID LOCKED:", id);
+                navigator.vibrate([50, 30, 50]);
+                lastDetectedId = id;
             }
-        } else {
-            if (Math.random() > 0.95) console.warn("Parity Check Failed - Internal bits not matching");
         }
-        return false;
     }
 
-    function drawLiveOutline(approx) {
+    function drawUI(approx) {
         const scale = overlay.width / GRID_SIZE;
-        oCtx.strokeStyle = "rgba(0, 255, 0, 0.7)";
-        oCtx.lineWidth = 4;
+        oCtx.strokeStyle = "#0f0";
+        oCtx.lineWidth = 3;
         oCtx.beginPath();
         oCtx.moveTo(approx.data32S[0]*scale, approx.data32S[1]*scale);
         oCtx.lineTo(approx.data32S[2]*scale, approx.data32S[3]*scale);
         oCtx.lineTo(approx.data32S[4]*scale, approx.data32S[5]*scale);
         oCtx.closePath();
         oCtx.stroke();
-    }
-
-    function drawAR(bits) {
-        const s = overlay.width * 0.5, h = s * Math.sin(Math.PI / 3);
-        oCtx.save();
-        oCtx.globalAlpha = 0.5;
-        oCtx.translate(overlay.width/2, overlay.height/2 - h/2);
-        let idx = 0;
-        const cS = s / 4, cH = cS * Math.sin(Math.PI / 3);
-        for (let row = 0; row < 4; row++) {
-            for (let i = 0; i < (row * 2 + 1); i++) {
-                const tx = (i - row) * (cS / 2), ty = row * cH;
-                oCtx.beginPath();
-                if (i % 2 === 0) { oCtx.moveTo(tx, ty); oCtx.lineTo(tx - cS/2, ty + cH); oCtx.lineTo(tx + cS/2, ty + cH); }
-                else { oCtx.moveTo(tx - cS/2, ty); oCtx.lineTo(tx + cS/2, ty); oCtx.lineTo(tx, ty + cH); }
-                oCtx.fillStyle = bits[idx] ? "#0f0" : "rgba(0,0,0,0.1)";
-                oCtx.fill(); oCtx.stroke();
-                idx++;
-            }
-        }
-        oCtx.restore();
     }
 </script>
 </body>
