@@ -3,19 +3,45 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Convex Hull v6</title>
+    <title>Sigil Scanner - 1:1 Square Edition</title>
     <script src="opencv.js?v=20260214" defer></script>
     <style>
-        body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
-        #camContainer { position: relative; flex: 1; display: flex; justify-content: center; align-items: center; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.8; }
-        canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
+        body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
         
-        #hud { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; z-index: 10; }
+        /* Force a Square Viewport for Camera */
+        #camContainer { 
+            position: relative; 
+            width: 100vw; 
+            height: 100vw; 
+            max-width: 600px; 
+            max-height: 600px; 
+            overflow: hidden; 
+            border: 2px solid #333;
+        }
+
+        video { 
+            position: absolute; 
+            width: 100%; 
+            height: 100%; 
+            object-fit: cover; /* Centers and crops the camera sensor to 1:1 */
+            opacity: 0.8; 
+        }
+
+        canvas#overlay { 
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            pointer-events: none; 
+            z-index: 5; 
+        }
+        
+        #hud { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; z-index: 10; pointer-events: none; }
         .status-box { 
-            background: rgba(10,10,10,0.5); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; 
+            background: rgba(10,10,10,0.6); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; 
             padding: 10px 20px; text-align: center; backdrop-filter: blur(5px);
-            display: flex; flex-direction: column; align-items: center; width: 160px;
+            display: flex; flex-direction: column; align-items: center; width: 140px;
         }
         #result { font-size: 1.8rem; font-weight: bold; color: #666; margin: 2px 0; }
         .label { font-size: 0.6rem; letter-spacing: 1px; color: #aaa; text-transform: uppercase; }
@@ -32,7 +58,7 @@
 
     <div id="hud">
         <div class="status-box" id="statusBox">
-            <div class="label" id="statusLabel">Searching...</div>
+            <div class="label" id="statusLabel">Square Scan</div>
             <div id="result">---</div>
         </div>
     </div>
@@ -50,7 +76,8 @@
     let idMatchCount = 0;
     const REQUIRED_MATCHES = 3;
 
-    const GRID_SIZE = 300;
+    // Fixed internal processing size
+    const GRID_SIZE = 400; 
     const hCanvas = document.createElement('canvas');
     hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d', { willReadFrequently: true });
@@ -58,17 +85,19 @@
     var Module = {
         onRuntimeInitialized: () => { 
             cvReady = true; 
-            console.log("CV System Online - PobleSec Ready");
+            console.log("1:1 CV System Ready");
             startCamera();
         }
     };
 
     async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { facingMode: "environment", aspectRatio: 1.0 } 
+        });
         video.srcObject = stream;
         video.onloadedmetadata = () => {
-            overlay.width = window.innerWidth;
-            overlay.height = window.innerHeight;
+            // Overlay and Video are now both synced 1:1 squares
+            overlay.width = overlay.height = camContainer.clientWidth;
             requestAnimationFrame(loop);
         };
     }
@@ -82,7 +111,15 @@
     }
 
     function processFrame() {
-        hCtx.drawImage(video, 0, 0, GRID_SIZE, GRID_SIZE);
+        // Draw centered 1:1 crop from video to hidden canvas
+        const vWidth = video.videoWidth;
+        const vHeight = video.videoHeight;
+        const minDim = Math.min(vWidth, vHeight);
+        const sx = (vWidth - minDim) / 2;
+        const sy = (vHeight - minDim) / 2;
+
+        hCtx.drawImage(video, sx, sy, minDim, minDim, 0, 0, GRID_SIZE, GRID_SIZE);
+
         let src = cv.imread(hCanvas);
         let gray = new cv.Mat();
         let binary = new cv.Mat();
@@ -96,49 +133,38 @@
         let hierarchy = new cv.Mat();
         cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        let foundLargest = false;
+        let foundThisFrame = false;
 
         if (contours.size() > 0) {
-            let maxArea = 0;
-            let maxIdx = -1;
+            let maxArea = 0, maxIdx = -1;
             for (let i = 0; i < contours.size(); ++i) {
                 let area = cv.contourArea(contours.get(i));
-                if (area > maxArea) {
-                    maxArea = area;
-                    maxIdx = i;
-                }
+                if (area > maxArea) { maxArea = area; maxIdx = i; }
             }
 
-            if (maxIdx !== -1 && maxArea > 2500) {
+            if (maxIdx !== -1 && maxArea > 3000) {
                 let cnt = contours.get(maxIdx);
                 let hull = new cv.Mat();
-                // 1. Convex Hull: Ignore internal noise
                 cv.convexHull(cnt, hull, false, true);
 
                 let approx = new cv.Mat();
-                let peri = cv.arcLength(hull, true);
-                // 2. Approximate Triangle: High epsilon for messy chalk
-                cv.approxPolyDP(hull, approx, 0.08 * peri, true);
+                cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
                 if (approx.rows === 3) {
-                    drawLiveOutline(approx); // Searching lines visible
-                    if (warpAndDecode(src, approx)) foundLargest = true;
-                } else {
-                    if (Math.random() > 0.99) console.debug(`Hull points: ${approx.rows}`);
+                    drawLiveOutline(approx);
+                    if (warpAndDecode(src, approx)) foundThisFrame = true;
                 }
-                hull.delete();
-                approx.delete();
+                hull.delete(); approx.delete();
             }
         }
 
-        if (!foundLargest) {
+        if (!foundThisFrame) {
             idMatchCount = 0;
             statusBox.classList.remove('success');
-            statusLabel.textContent = "Searching...";
+            statusLabel.textContent = "Square Scan";
         }
 
-        src.delete(); gray.delete(); binary.delete(); blurred.delete(); 
-        contours.delete(); hierarchy.delete();
+        src.delete(); gray.delete(); binary.delete(); blurred.delete(); contours.delete(); hierarchy.delete();
     }
 
     function warpAndDecode(src, approx) {
@@ -146,39 +172,32 @@
         for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
         pts.sort((a, b) => a.y - b.y);
         let apex = pts[0], base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
-        let bl = base[0], br = base[1];
 
-        let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
-        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 40, 40, 260, 260, 260]);
+        let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, base[0].x, base[0].y, base[1].x, base[1].y]);
+        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [200, 50, 50, 350, 350, 350]);
         let M = cv.getAffineTransform(srcPts, dstPts);
         let warped = new cv.Mat();
         cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
 
         cv.imshow(hCanvas, warped);
-        const bits = sampleWarpedGrid();
+        const bits = sampleGrid();
         
         let success = false;
-        if (bits[0] === 1 && bits[9] === 1) { // Anchor checks
-            success = validateSigil(bits);
-        } else {
-            if (Math.random() > 0.95) console.warn("Orientation/Anchor fail");
-        }
+        if (bits[0] === 1 && bits[9] === 1) success = validateSigil(bits);
 
         warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
         return success;
     }
 
-    function sampleWarpedGrid() {
+    function sampleGrid() {
         const bits = [];
-        const size = 220 / 4, h = size * Math.sin(Math.PI / 3), startY = 40;
+        const s = 300 / 4, h = s * Math.sin(Math.PI / 3), startY = 50;
         for (let row = 0; row < 4; row++) {
-            const numInRow = (row * 2) + 1;
-            for (let i = 0; i < numInRow; i++) {
-                const x = 150 + (i - row) * (size / 2);
+            for (let i = 0; i < (row * 2 + 1); i++) {
+                const x = 200 + (i - row) * (s / 2);
                 const y = startY + (row * h) + (h / 2);
                 const pix = hCtx.getImageData(x, y, 1, 1).data;
-                const brightness = (pix[0] + pix[1] + pix[2]) / 3;
-                bits.push(brightness < 115 ? 1 : 0);
+                bits.push(((pix[0] + pix[1] + pix[2]) / 3) < 110 ? 1 : 0);
             }
         }
         return bits;
@@ -194,61 +213,48 @@
 
         if (S_Read.every((v, i) => v === S_Calc[i])) {
             const currentId = parseInt(D.join(''), 2);
-            if (currentId === lastDetectedId) {
-                idMatchCount++;
-            } else {
-                idMatchCount = 1;
-                lastDetectedId = currentId;
-            }
+            if (currentId === lastDetectedId) idMatchCount++;
+            else { idMatchCount = 1; lastDetectedId = currentId; }
 
             if (idMatchCount >= REQUIRED_MATCHES) {
                 resultDisplay.textContent = currentId.toString().padStart(3, '0');
                 statusLabel.textContent = "LOCKED";
                 statusBox.classList.add('success');
-                drawReconstructionOverlay(bits);
+                drawAR(bits);
                 if (idMatchCount === REQUIRED_MATCHES) navigator.vibrate(50);
                 return true;
             }
-        } else {
-            if (Math.random() > 0.98) console.debug("Parity Error");
         }
         return false;
     }
 
     function drawLiveOutline(approx) {
-        const scaleX = window.innerWidth / GRID_SIZE;
-        const scaleY = window.innerHeight / GRID_SIZE;
+        const scale = overlay.width / GRID_SIZE;
         oCtx.strokeStyle = "rgba(0, 255, 0, 0.7)";
-        oCtx.lineWidth = 3;
+        oCtx.lineWidth = 4;
         oCtx.beginPath();
-        oCtx.moveTo(approx.data32S[0]*scaleX, approx.data32S[1]*scaleY);
-        oCtx.lineTo(approx.data32S[2]*scaleX, approx.data32S[3]*scaleY);
-        oCtx.lineTo(approx.data32S[4]*scaleX, approx.data32S[5]*scaleY);
+        oCtx.moveTo(approx.data32S[0]*scale, approx.data32S[1]*scale);
+        oCtx.lineTo(approx.data32S[2]*scale, approx.data32S[3]*scale);
+        oCtx.lineTo(approx.data32S[4]*scale, approx.data32S[5]*scale);
         oCtx.closePath();
         oCtx.stroke();
     }
 
-    function drawReconstructionOverlay(bits) {
-        const centerX = overlay.width / 2, centerY = overlay.height / 2;
-        const s = Math.min(overlay.width, overlay.height) * 0.45; 
-        const h = s * Math.sin(Math.PI / 3);
+    function drawAR(bits) {
+        const s = overlay.width * 0.5, h = s * Math.sin(Math.PI / 3);
         oCtx.save();
         oCtx.globalAlpha = 0.5;
-        oCtx.translate(centerX, centerY - h/2);
+        oCtx.translate(overlay.width/2, overlay.height/2 - h/2);
         let idx = 0;
-        const cellSize = s / 4, cellH = cellSize * Math.sin(Math.PI / 3);
+        const cS = s / 4, cH = cS * Math.sin(Math.PI / 3);
         for (let row = 0; row < 4; row++) {
             for (let i = 0; i < (row * 2 + 1); i++) {
-                const tx = (i - row) * (cellSize / 2), ty = row * cellH;
+                const tx = (i - row) * (cS / 2), ty = row * cH;
                 oCtx.beginPath();
-                if (i % 2 === 0) {
-                    oCtx.moveTo(tx, ty); oCtx.lineTo(tx - cellSize/2, ty + cellH); oCtx.lineTo(tx + cellSize/2, ty + cellH);
-                } else {
-                    oCtx.moveTo(tx - cellSize/2, ty); oCtx.lineTo(tx + cellSize/2, ty); oCtx.lineTo(tx, ty + cellH);
-                }
+                if (i % 2 === 0) { oCtx.moveTo(tx, ty); oCtx.lineTo(tx - cS/2, ty + cH); oCtx.lineTo(tx + cS/2, ty + cH); }
+                else { oCtx.moveTo(tx - cS/2, ty); oCtx.lineTo(tx + cS/2, ty); oCtx.lineTo(tx, ty + cH); }
                 oCtx.fillStyle = bits[idx] ? "#0f0" : "rgba(0,0,0,0.1)";
-                oCtx.fill();
-                oCtx.stroke();
+                oCtx.fill(); oCtx.stroke();
                 idx++;
             }
         }
