@@ -3,50 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - 1:1 Square Edition</title>
+    <title>Sigil Scanner - Debug 1:1</title>
     <script src="opencv.js?v=20260214" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
-        
-        /* Force a Square Viewport for Camera */
-        #camContainer { 
-            position: relative; 
-            width: 100vw; 
-            height: 100vw; 
-            max-width: 600px; 
-            max-height: 600px; 
-            overflow: hidden; 
-            border: 2px solid #333;
-        }
-
-        video { 
-            position: absolute; 
-            width: 100%; 
-            height: 100%; 
-            object-fit: cover; /* Centers and crops the camera sensor to 1:1 */
-            opacity: 0.8; 
-        }
-
-        canvas#overlay { 
-            position: absolute; 
-            top: 0; 
-            left: 0; 
-            width: 100%; 
-            height: 100%; 
-            pointer-events: none; 
-            z-index: 5; 
-        }
-        
+        #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; max-height: 500px; overflow: hidden; border: 1px solid #444; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; opacity: 0.8; }
+        canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
         #hud { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; z-index: 10; pointer-events: none; }
         .status-box { 
-            background: rgba(10,10,10,0.6); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; 
-            padding: 10px 20px; text-align: center; backdrop-filter: blur(5px);
-            display: flex; flex-direction: column; align-items: center; width: 140px;
+            background: rgba(10,10,10,0.5); border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; 
+            padding: 10px 20px; text-align: center; backdrop-filter: blur(5px); width: 140px;
         }
-        #result { font-size: 1.8rem; font-weight: bold; color: #666; margin: 2px 0; }
+        #result { font-size: 1.8rem; font-weight: bold; color: #444; margin: 2px 0; }
         .label { font-size: 0.6rem; letter-spacing: 1px; color: #aaa; text-transform: uppercase; }
-        .success #result { color: #0f0; }
-        .success { border-color: #0f0; background: rgba(0,40,0,0.5); }
+        .success #result { color: #0f0; text-shadow: 0 0 10px #0f0; }
+        .success { border-color: #0f0; background: rgba(0,40,0,0.4); }
     </style>
 </head>
 <body>
@@ -76,27 +48,17 @@
     let idMatchCount = 0;
     const REQUIRED_MATCHES = 3;
 
-    // Fixed internal processing size
     const GRID_SIZE = 400; 
     const hCanvas = document.createElement('canvas');
     hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d', { willReadFrequently: true });
 
-    var Module = {
-        onRuntimeInitialized: () => { 
-            cvReady = true; 
-            console.log("1:1 CV System Ready");
-            startCamera();
-        }
-    };
+    var Module = { onRuntimeInitialized: () => { cvReady = true; console.log("1:1 CV Ready. Checking bits..."); startCamera(); } };
 
     async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-            video: { facingMode: "environment", aspectRatio: 1.0 } 
-        });
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
         video.srcObject = stream;
         video.onloadedmetadata = () => {
-            // Overlay and Video are now both synced 1:1 squares
             overlay.width = overlay.height = camContainer.clientWidth;
             requestAnimationFrame(loop);
         };
@@ -111,59 +73,48 @@
     }
 
     function processFrame() {
-        // Draw centered 1:1 crop from video to hidden canvas
-        const vWidth = video.videoWidth;
-        const vHeight = video.videoHeight;
-        const minDim = Math.min(vWidth, vHeight);
-        const sx = (vWidth - minDim) / 2;
-        const sy = (vHeight - minDim) / 2;
-
-        hCtx.drawImage(video, sx, sy, minDim, minDim, 0, 0, GRID_SIZE, GRID_SIZE);
+        const vW = video.videoWidth, vH = video.videoHeight;
+        const minD = Math.min(vW, vH);
+        const sx = (vW - minD) / 2, sy = (vH - minD) / 2;
+        hCtx.drawImage(video, sx, sy, minD, minD, 0, 0, GRID_SIZE, GRID_SIZE);
 
         let src = cv.imread(hCanvas);
-        let gray = new cv.Mat();
-        let binary = new cv.Mat();
-        let blurred = new cv.Mat();
+        let gray = new cv.Mat(), binary = new cv.Mat(), blurred = new cv.Mat();
         
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
         cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
         cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
 
-        let contours = new cv.MatVector();
-        let hierarchy = new cv.Mat();
+        let contours = new cv.MatVector(), hierarchy = new cv.Mat();
         cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        let foundThisFrame = false;
-
+        let found = false;
         if (contours.size() > 0) {
-            let maxArea = 0, maxIdx = -1;
+            let maxA = 0, maxI = -1;
             for (let i = 0; i < contours.size(); ++i) {
-                let area = cv.contourArea(contours.get(i));
-                if (area > maxArea) { maxArea = area; maxIdx = i; }
+                let a = cv.contourArea(contours.get(i));
+                if (a > maxA) { maxA = a; maxI = i; }
             }
 
-            if (maxIdx !== -1 && maxArea > 3000) {
-                let cnt = contours.get(maxIdx);
-                let hull = new cv.Mat();
+            if (maxI !== -1 && maxA > 3000) {
+                let cnt = contours.get(maxI);
+                let hull = new cv.Mat(), approx = new cv.Mat();
                 cv.convexHull(cnt, hull, false, true);
-
-                let approx = new cv.Mat();
                 cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
                 if (approx.rows === 3) {
                     drawLiveOutline(approx);
-                    if (warpAndDecode(src, approx)) foundThisFrame = true;
+                    if (warpAndDecode(src, approx)) found = true;
                 }
                 hull.delete(); approx.delete();
             }
         }
 
-        if (!foundThisFrame) {
+        if (!found) {
             idMatchCount = 0;
             statusBox.classList.remove('success');
-            statusLabel.textContent = "Square Scan";
+            statusLabel.textContent = "Searching...";
         }
-
         src.delete(); gray.delete(); binary.delete(); blurred.delete(); contours.delete(); hierarchy.delete();
     }
 
@@ -179,11 +130,19 @@
         let warped = new cv.Mat();
         cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
 
-        cv.imshow(hCanvas, warped);
+        cv.imshow(hCanvas, warped); // Updates hidden canvas for sampling
         const bits = sampleGrid();
         
+        // DEBUG: See the raw bitstream in console
+        if (Math.random() > 0.9) console.log("Raw Bits Sampled:", bits.join(''));
+
         let success = false;
-        if (bits[0] === 1 && bits[9] === 1) success = validateSigil(bits);
+        // Anchor Check: Top Triangle (0) and Bottom-Left (9) MUST be black (1)
+        if (bits[0] === 1 && bits[9] === 1) {
+            success = validateSigil(bits);
+        } else {
+            if (Math.random() > 0.9) console.warn(`Anchors failed: Top=${bits[0]}, B-Left=${bits[9]}`);
+        }
 
         warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
         return success;
@@ -197,7 +156,9 @@
                 const x = 200 + (i - row) * (s / 2);
                 const y = startY + (row * h) + (h / 2);
                 const pix = hCtx.getImageData(x, y, 1, 1).data;
-                bits.push(((pix[0] + pix[1] + pix[2]) / 3) < 110 ? 1 : 0);
+                const brightness = (pix[0] + pix[1] + pix[2]) / 3;
+                // Thresholding: Adjust 120 if your screen/chalk is too light/dark
+                bits.push(brightness < 120 ? 1 : 0);
             }
         }
         return bits;
@@ -221,9 +182,14 @@
                 statusLabel.textContent = "LOCKED";
                 statusBox.classList.add('success');
                 drawAR(bits);
-                if (idMatchCount === REQUIRED_MATCHES) navigator.vibrate(50);
+                if (idMatchCount === REQUIRED_MATCHES) {
+                    console.log(`%c ID DETECTED: ${currentId} `, 'background: #0f0; color: #000; font-weight: bold;');
+                    navigator.vibrate(50);
+                }
                 return true;
             }
+        } else {
+            if (Math.random() > 0.95) console.warn("Parity Check Failed - Internal bits not matching");
         }
         return false;
     }
