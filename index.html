@@ -138,28 +138,39 @@
     }
 
     function warpAndDecode(src, approx) {
-        // 1. Sort points (Apex, BL, BR) for Affine Warp
-        let pts = [];
-        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
-        pts.sort((a, b) => a.y - b.y); // Apex is highest y
-        let apex = pts[0];
-        let base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
-        let bl = base[0], br = base[1];
+    // 1. NORMALIZE POINTS: Find which corner is the "Top"
+    let pts = [];
+    for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
+    
+    // Logic: The "Apex" is the point furthest from the midpoint of the other two
+    // For street scanning, we assume the highest Y is the Apex (or use the Anchor check)
+    pts.sort((a, b) => a.y - b.y); 
+    let apex = pts[0]; 
+    let base = [pts[1], pts[2]].sort((a, b) => a.x - b.x);
+    let bl = base[0], br = base[1];
 
-        // 2. Map to standard 300x300 grid
-        let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
-        let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 20, 20, 280, 280, 280]);
-        let M = cv.getAffineTransform(srcPts, dstPts);
-        let warped = new cv.Mat();
-        cv.warpAffine(src, warped, M, new cv.Size(GRID_SIZE, GRID_SIZE));
+    // 2. DEFINE THE IDEAL GRID (300x300 square)
+    let srcPts = cv.matFromArray(3, 1, cv.CV_32FC2, [apex.x, apex.y, bl.x, bl.y, br.x, br.y]);
+    let dstPts = cv.matFromArray(3, 1, cv.CV_32FC2, [150, 30, 30, 270, 270, 270]);
 
-        // 3. Sample 16 Points
-        cv.imshow(hCanvas, warped);
-        const bits = sampleGrid();
-        validateID(bits);
-
-        warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
+    // 3. WARP: This flattens the perspective
+    let M = cv.getAffineTransform(srcPts, dstPts);
+    let warped = new cv.Mat();
+    cv.warpAffine(src, warped, M, new cv.Size(300, 300));
+    
+    // 4. DIVIDE INTO 4 LEVELS (The Matrix)
+    // Now that it's flat, we sample the 16 centers of the sub-triangles
+    cv.imshow(hCanvas, warped); // Render to hidden canvas for sampling
+    const bits = sampleWarpedGrid();
+    
+    // 5. READ ANCHORS & DATA
+    if (bits[0] === 1 && bits[9] === 1) { // Apex and Left-Anchor must be black
+        validateSigil(bits);
     }
+
+    // Memory Cleanup
+    warped.delete(); M.delete(); srcPts.delete(); dstPts.delete();
+}
 
     function sampleGrid() {
         const size = GRID_SIZE / 4;
