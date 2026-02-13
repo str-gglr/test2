@@ -91,9 +91,14 @@
     }
 
     function processFrame() {
-        let src = cv.imread(video);
-        let gray = new cv.Mat();
-        let binary = new cv.Mat();
+    // 1. Draw the current video frame onto the hidden canvas first
+    hCtx.drawImage(video, 0, 0, hCanvas.width, hCanvas.height);
+
+    // 2. Point OpenCV to the CANVAS element, not the video object
+    let src = cv.imread(hCanvas); 
+    
+    let gray = new cv.Mat();
+    let binary = new cv.Mat();
         
         // 1. Convert and Threshold
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
