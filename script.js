@@ -25,26 +25,26 @@ let centroids = [];   // 16 centroid positions in canonical warp space
 let rotationMaps = {};   // 0 → identity,  1 → 120°,  2 → 240°
 
 // ===== BIT LAYOUT (canonical, after rotation alignment) =====
-//  Index  0 = Anchor A1  (always BLACK)
-//  Index  9 = Anchor A2  (always BLACK)
-//  Index 15 = Sync   S   (always WHITE)
-//  Indices 1–8, 10        = Data  D1…D9
-//  Indices 11–14          = Parity P1…P4
+// Row 1: Index 0 = Black Anchor
+// Row 2: Index 1=D1, 2=P1, 3=D2
+// Row 3: Index 4=D3, 5=D4, 6=P2, 7=D5, 8=D6
+// Row 4: Index 9=Black Anchor, 10=P3, 11=D7, 12=D8, 13=D9, 14=P4, 15=White Anchor
+
 const ANCHOR_INDICES = [0, 9];
 const SYNC_INDEX = 15;
-const DATA_INDICES = [1, 2, 3, 4, 5, 6, 7, 8, 10];   // D1…D9
-const PARITY_INDICES = [11, 12, 13, 14];                  // P1…P4
+const DATA_INDICES = [1, 3, 4, 5, 7, 8, 11, 12, 13];  // D1-D9 in order
+const PARITY_INDICES = [2, 6, 10, 14];                    // P1-P4 in order
 
-// Hamming-style parity subsets (indices into DATA_INDICES array)
-//  P1 = D1⊕D2⊕D4⊕D5⊕D7⊕D9
-//  P2 = D1⊕D3⊕D4⊕D6⊕D7
-//  P3 = D2⊕D3⊕D4⊕D8⊕D9
-//  P4 = D5⊕D6⊕D7⊕D8⊕D9
-const PARITY_SUBSETS = [
-    [0, 1, 3, 4, 6, 8],   // P1
-    [0, 2, 3, 5, 6],      // P2
-    [1, 2, 3, 7, 8],      // P3
-    [4, 5, 6, 7, 8]       // P4
+// Exact parity formulas from the generator:
+// P1 (S1) = D1 ⊕ D2 ⊕ D4 ⊕ D5 ⊕ D7 ⊕ D9  (dataBits indices: 0,1,3,4,6,8)
+// P2 (S2) = D3 ⊕ D4 ⊕ D5 ⊕ D6 ⊕ D8 ⊕ D9  (dataBits indices: 2,3,4,5,7,8)
+// P3 (S3) = D1 ⊕ D3 ⊕ D4 ⊕ D7 ⊕ D8       (dataBits indices: 0,2,3,6,7)
+// P4 (S4) = D2 ⊕ D5 ⊕ D6 ⊕ D8 ⊕ D9       (dataBits indices: 1,4,5,7,8)
+const PARITY_FORMULAS = [
+    [0, 1, 3, 4, 6, 8],  // P1
+    [2, 3, 4, 5, 7, 8],  // P2
+    [0, 2, 3, 6, 7],     // P3
+    [1, 4, 5, 7, 8]      // P4
 ];
 
 // ===== MULTI-FRAME CONFIRMATION STATE =====
@@ -78,6 +78,7 @@ function generateCentroids() {
             idx++;
         }
     }
+    console.log('Generated centroids:', centroids);
 }
 
 // ============================================================
@@ -112,6 +113,8 @@ function generateRotationMaps() {
 
     rotationMaps[1] = buildMap(2 * Math.PI / 3);   // 120°
     rotationMaps[2] = buildMap(4 * Math.PI / 3);    // 240°
+
+    console.log('Rotation maps:', rotationMaps);
 }
 
 // ============================================================
@@ -290,15 +293,6 @@ function processVideo() {
 
 // ============================================================
 //  DECODE SIGIL
-//  1. Affine-warp detected triangle → canonical equilateral
-//  2. Sample 16 centroids (area-averaged)
-//  3. Try all 3 rotations; for each:
-//      a. Use 2 black anchors  → darkRef  (floor of darkness)
-//      b. Use 1 white sync     → lightRef (ceiling of brightness)
-//      c. Adaptive threshold   = darkRef + 0.5 × (lightRef − darkRef)
-//      d. Classify 16 bits
-//      e. Verify parity
-//  4. Return best-contrast valid decode, or null.
 // ============================================================
 function decodeSigil(triPts) {
     // 1. Sort vertices: top-most first, then left-before-right for bottom pair
@@ -374,18 +368,31 @@ function decodeSigil(triPts) {
         const dataBits = DATA_INDICES.map(i => bits[i]);
         const parityBits = PARITY_INDICES.map(i => bits[i]);
 
-        // Verify parity
-        let parityOk = true;
-        for (let p = 0; p < 4; p++) {
-            let expected = 0;
-            for (const di of PARITY_SUBSETS[p]) expected ^= dataBits[di];
-            if (expected !== parityBits[p]) { parityOk = false; break; }
-        }
-        if (!parityOk) continue;
-
         // Compute ID from 9 data bits (MSB-first → 0…511)
         let id = 0;
         for (let i = 0; i < 9; i++) id = (id << 1) | dataBits[i];
+
+        // Parity validation
+        let parityOk = true;
+        for (let p = 0; p < 4; p++) {
+            let expected = 0;
+            for (const idx of PARITY_FORMULAS[p]) {
+                expected ^= dataBits[idx];
+            }
+            if (expected !== parityBits[p]) {
+                parityOk = false;
+                break;
+            }
+        }
+
+        console.log('Rot ' + (rot * 120) + '° - ID: ' + id +
+            ' - Parity: ' + (parityOk ? 'PASS ✓' : 'FAIL ✗') +
+            ' - Bits: ' + bits.join('') +
+            ' - Data: ' + dataBits.join('') +
+            ' - Contrast: ' + Math.round(contrast));
+
+        // Skip if parity fails
+        if (!parityOk) continue;
 
         // Keep the decode with the highest contrast (best quality)
         if (contrast > bestContrast) {
@@ -414,8 +421,6 @@ function decodeSigil(triPts) {
 
 // ============================================================
 //  MULTI-FRAME CONFIRMATION
-//  Only "lock" an ID after CONFIRM_NEEDED consecutive identical reads.
-//  Auto-unlocks after 5 s so scanning resumes.
 // ============================================================
 function handleDetection(result) {
     if (result.id === lastSeenId) {
