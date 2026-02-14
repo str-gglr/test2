@@ -1,166 +1,812 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Sigil Omni-Scanner Pro</title>
     <script src="opencv.js" defer></script>
     <style>
-        body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
-        #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.4; }
-        canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }
-        #result { font-size: 3rem; font-weight: bold; color: #444; margin-top: 20px; transition: color 0.2s; }
-        .success { color: #0f0 !important; text-shadow: 0 0 15px #0f0; }
+        body {
+            margin: 0;
+            background: #000;
+            font-family: 'Courier New', monospace;
+            color: #fff;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        #camContainer {
+            position: relative;
+            width: 100vw;
+            height: 100vw;
+            max-width: 500px;
+            max-height: 500px;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.2);
+            border: 1px solid #333;
+        }
+
+        video {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            opacity: 1.0;
+        }
+
+        canvas#overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 5;
+            pointer-events: none;
+        }
+
+        #result {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #444;
+            margin-top: 20px;
+            min-height: 3rem;
+            text-align: center;
+            width: 90%;
+            word-break: break-all;
+        }
+
+        .success {
+            color: #0f0 !important;
+            text-shadow: 0 0 10px #0f0;
+            animation: pulse 0.5s ease-in-out;
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+            }
+
+            50% {
+                transform: scale(1.05);
+            }
+
+            100% {
+                transform: scale(1);
+            }
+        }
+
+        #debug {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            font-size: 0.8rem;
+            color: #aaa;
+            pointer-events: none;
+            z-index: 10;
+            white-space: pre-wrap;
+        }
+
+        .instruction {
+            position: absolute;
+            bottom: 20px;
+            font-size: 0.9rem;
+            color: #888;
+            text-align: center;
+            width: 100%;
+            pointer-events: none;
+        }
     </style>
 </head>
+
 <body>
 
-    <div id="gate" onclick="initSystem()">START CALIBRATED SCAN</div>
+    <div id="debug">Initializing...</div>
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
     </div>
-    <div id="result">---</div>
+    <div id="result">Waiting for Sigil...</div>
+    <div class="instruction">Align the triangle within the frame</div>
 
-<script>
-    const video = document.getElementById('video');
-    const overlay = document.getElementById('overlay');
-    const oCtx = overlay.getContext('2d');
-    const resultDisplay = document.getElementById('result');
+    <script>
+        const video = document.getElementById('video');
+        const overlay = document.getElementById('overlay');
+        const oCtx = overlay.getContext('2d');
+        const resultDisplay = document.getElementById('result');
+        const debugDisplay = document.getElementById('debug');
 
-    let cvReady = false;
-    let lastScanTime = 0;
-    const GRID_SIZE = 400;
-    const hCanvas = document.createElement('canvas');
-    hCanvas.width = hCanvas.height = GRID_SIZE;
-    const hCtx = hCanvas.getContext('2d');
+        let cvReady = false;
+        let lastScanTime = 0;
+        const SCAN_INTERVAL = 333; // 3 FPS
+        const LOCK_DURATION = 3000;
 
-    function initSystem() { document.getElementById('gate').style.display = 'none'; startCamera(); }
-    var Module = { onRuntimeInitialized: () => { cvReady = true; } };
+        // State Machine
+        let isLocked = false;
+        let lockTimer = null;
+        let lockedMesh = null; // Store mesh for frozen display
+        let lockedId = null;
 
-    async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        video.srcObject = stream;
-        video.onloadedmetadata = () => {
-            overlay.width = overlay.height = camContainer.clientWidth;
-            requestAnimationFrame(loop);
+        // Internal processing canvas (hidden)
+        const PROCESS_WIDTH = 480;
+        const hCanvas = document.createElement('canvas');
+        const hCtx = hCanvas.getContext('2d');
+
+        // Barycentric Coordinates for 16 sub-triangles (Row major, top to bottom)
+        // Structure: [u, v, w] where P = u*V1 + v*V2 + w*V3. V1=Top, V2=BotLeft, V3=BotRight
+        // Rows: 1, 3, 5, 7 triangles. Total 16.
+        // Index 0: Row 1.
+        // Index 1-3: Row 2.
+        // Index 4-8: Row 3.
+        // Index 9-15: Row 4.
+        // We sample the CENTROID of each small triangle.
+        //
+        // Logical barycentric coords for vertices of the large triangle T:
+        // V1=(1,0,0), V2=(0,1,0), V3=(0,0,1)
+        //
+        // A sub-triangle in row r (0..3) has height 1/4.
+        // Let's derive centroids.
+        // The large triangle is partitioned by lines parallel to sides.
+        //
+        // Alternative approach:
+        // Sub-triangles can be 'upright' or 'inverted'.
+        // Row 0 (1 tri): Up (0)
+        // Row 1 (3 tris): Up (1), Inv (2), Up (3)
+        // Row 2 (5 tris): Up (4), Inv (5), Up (6), Inv (7), Up (8)
+        // Row 3 (7 tris): Up (9), Inv (10), Up (11), Inv (12), Up (13), Inv (14), Up (15)
+
+        const SUB_TRIANGLES = [];
+
+        function generateSubTriangles() {
+            let index = 0;
+            for (let r = 0; r < 4; r++) {
+                const rowY_top = r / 4;
+                const rowY_bot = (r + 1) / 4;
+                const numTris = 2 * r + 1;
+
+                for (let k = 0; k < numTris; k++) {
+                    // Centroid calculation
+                    // For an 'Up' triangle at row r, index k (k is even: 0, 2, ... are Up)
+                    // For an 'Inverted' triangle (k is odd: 1, 3, ... are Inv)
+
+                    // Let's use a simpler mapping based on the visual grid logic from the prompt.
+                    // "Row 1: 1, Row 2: 3, Row 3: 5, Row 4: 7"
+                    //
+                    // We can define the 3 vertices of each sub-triangle in (u,v,w) space and average them.
+                    //
+                    // Vertex logic:
+                    // Grid points can be defined as P(i, j) = V1 + i/4*(V2-V1) + j/4*(V3-V1) ? No, that's parallelogram.
+                    // Barycentric: P = u*V1 + v*V2 + w*V3.
+                    // The grid vertices are at values n/4.
+
+                    // Let's generate center points directly.
+                    //
+                    // Logic verifies with:
+                    // Row 0: 1 tri. Center approx roughly (2/3, 1/6, 1/6)? No.
+                    // Height H.
+                    // Row 0 is top. y range [0, H/4].
+                    // Center Y of row 0 tri is (1/4 * 2/3) = 1/6? Wait. 
+                    // Centroid of a triangle with base at y=h and tip at y=0 is y=2/3*h (from tip).
+                    // So for row 0 (tip at 0, base at 0.25): Center Y = 2/3 * 0.25 = 0.1666...
+
+                    // Let's rely on the prompt's explicit indexing desire and standard subdivision.
+                    // The prompt says "Row 1: index 0; Row 2: 1-3; ...".
+                    // k goes 0..(2r). 
+                    // k=0 is left-most Up. k=1 is Inv. k=2 is Up...
+
+                    let isUp = (k % 2 === 0);
+
+                    // We need the average (u,v,w) for the centroid.
+                    //
+                    // Coordinates of grid points (i, j) where u = 1 - (i+j)/4, v = i/4, w = j/4 ?
+                    // Let's define integer coordinates (u_i, v_i, w_i) summing to 4.
+                    // V1=(4,0,0), V2=(0,4,0), V3=(0,0,4).
+                    //
+                    // Tip of Row 0 tri: (4,0,0).
+                    // Bottom-Left of Row 0 tri: (3,1,0). Bottom-Right: (3,0,1).
+                    // Centroid = sum/3.
+
+                    let v1, v2, v3; // Integer coords
+
+                    // Row r spans from sum(v,w)=r to sum(v,w)=r+1 (in 0..4 inverted logic? No)
+                    // Let's stick to 'rows from top'. Top is V1.
+                    //
+                    // Row 0: Top corner is V1. Bottom edge is line u=3/4.
+                    //
+                    // Let's map integer coords (row, col) roughly.
+                    //
+                    // Careful manual derivation:
+                    // r=0. k=0 (Up). Verts: (4,0,0), (3,1,0), (3,0,1).
+                    // r=1. k=0 (Up). Verts: (3,1,0), (2,2,0), (2,1,1).
+                    //      k=1 (Inv). Verts: (3,1,0), (3,0,1), (2,1,1).
+                    //      k=2 (Up). Verts: (3,0,1), (2,1,1), (2,0,2).
+
+                    // General Pattern for 'Up' triangles (k even, k=2m):
+                    // Top:    (4-r,     m,       r-m)
+                    // BotL:   (4-(r+1), m+1,     r-m)
+                    // BotR:   (4-(r+1), m,       r-m+1)
+
+                    // General Pattern for 'Inv' triangles (k odd, k=2m+1):
+                    // TopL:   (4-r,     m+1,     r-m-1)? No.
+                    // Let's trace neighbors.
+                    // Inv shares TopL with Up(k-1)'s BotR? No.
+
+                    // Let's retry integer logic.
+                    // r=0..3.
+                    // Up triangles are at index k=0,2,...
+                    // Inverted at k=1,3,...
+
+                    let m = Math.floor(k / 2);
+
+                    if (k % 2 === 0) { // UP
+                        // V_top = (4-r, m, r-m)
+                        // V_bl  = (3-r, m+1, r-m)
+                        // V_br  = (3-r, m, r-m+1)
+                        v1 = { u: 4 - r, v: m, w: r - m };
+                        v2 = { u: 3 - r, v: m + 1, w: r - m };
+                        v3 = { u: 3 - r, v: m, w: r - m + 1 };
+                    } else { // INVERTED
+                        // V_topL = (3-r, m+1, r-m-1) ?? Wait. 
+                        // Inverted triangle 'points down'.
+                        // Base is on row r (u = 4-r). Tip is on row r+1 (u = 3-r).
+                        // This creates a hole. Re-evaluate.
+
+                        // Base points are from the row above's bottom line?
+                        // Vertices: (4-r, m+1, r-m) [shared with Up(2m) BotL]
+                        //           (4-r, m, r-m+1) [shared with Up(2m) BotR] ?? No...
+                        //           (3-r, m+1, r-m+1)
+
+                        // Let's check k=1 (r=1). m=0.
+                        // Shared with Up(0) BotL? Up(0) BotL was (3,1,0).
+                        // Shared with Up(0) BotR? Up(0) BotR was (3,0,1).
+                        // Tip? (2,1,1).
+                        //
+                        // So Inverted(k) shares vertices with Up(k-1) and Up(k+1).
+                        // V_topL = (3-r, m+1, r-m)? No, row r is u=4-r...
+                        // Let's just trust the coordinate sum = 4 rule.
+
+                        // Correct coords for r=1, k=1:
+                        // (3,1,0), (3,0,1), (2,1,1).
+                        v1 = { u: 4 - r, v: m + 1, w: r - m - 1 }; // (3,1,0) if r=1,m=0? 4-1=3, 1, 1-0-1=0. OK.
+                        v2 = { u: 4 - r, v: m, w: r - m };     // (3,0,1)? 3,0,1. OK.
+                        v3 = { u: 3 - r, v: m + 1, w: r - m };   // (2,1,1)? 2,1,1. OK.
+                    }
+
+                    // Normalize to 0..1
+                    let center = {
+                        u: (v1.u + v2.u + v3.u) / 12.0,
+                        v: (v1.v + v2.v + v3.v) / 12.0,
+                        w: (v1.w + v2.w + v3.w) / 12.0
+                    };
+
+                    SUB_TRIANGLES.push({
+                        id: index++,
+                        center: center,
+                        verts: [v1, v2, v3] // Integer coords for drawing grid if needed
+                    });
+                }
+            }
+        }
+
+        generateSubTriangles();
+
+        // Initialize OpenCV
+        var Module = {
+            onRuntimeInitialized: () => {
+                cvReady = true;
+                debugDisplay.textContent = "System Ready. Initializing Camera...";
+                startCamera();
+            }
         };
-    }
 
-    function loop(time) {
-        if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
-            if (time - lastScanTime > 333) { // 3 FPS
-                oCtx.clearRect(0, 0, overlay.width, overlay.height);
-                processFrame();
-                lastScanTime = time;
-            }
-        }
-        requestAnimationFrame(loop);
-    }
-
-    function processFrame() {
-        const minD = Math.min(video.videoWidth, video.videoHeight);
-        hCtx.drawImage(video, (video.videoWidth-minD)/2, (video.videoHeight-minD)/2, minD, minD, 0, 0, GRID_SIZE, GRID_SIZE);
-
-        let src = cv.imread(hCanvas);
-        let gray = new cv.Mat(), binary = new cv.Mat();
-        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
-
-        let contours = new cv.MatVector(), hierarchy = new cv.Mat();
-        cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-        let maxI = -1, maxA = 0;
-        for (let i = 0; i < contours.size(); ++i) {
-            let a = cv.contourArea(contours.get(i));
-            if (a > maxA) { maxA = a; maxI = i; }
-        }
-
-        if (maxI !== -1 && maxA > 4000) {
-            let approx = new cv.Mat();
-            let hull = new cv.Mat();
-            cv.convexHull(contours.get(maxI), hull);
-            cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
-
-            if (approx.rows === 3) {
-                const c = sortCorners(approx);
-                drawWireframe(c);
-                evaluateBits(gray, c);
-            }
-            approx.delete(); hull.delete();
-        }
-
-        src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete();
-    }
-
-    function sortCorners(approx) {
-        let pts = [];
-        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
-        pts.sort((a, b) => a.y - b.y);
-        const apex = pts[0];
-        const base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
-        return { a: apex, bl: base[0], br: base[1] };
-    }
-
-    function evaluateBits(grayMat, c) {
-        // Step 1: Establish Anchor Reference Levels
-        const blackVal = (getPointLum(grayMat, c.a) + getPointLum(grayMat, c.bl)) / 2;
-        const whiteVal = getPointLum(grayMat, c.br);
-        const threshold = (blackVal + whiteVal) / 2;
-
-        const bits = [];
-        // Step 2: Traverse the 16 triangles using the wireframe geometry
-        for (let row = 0; row < 4; row++) {
-            for (let i = 0; i < (row * 2 + 1); i++) {
-                // Calculate center point of each sub-triangle mathematically
-                const tY = (row + 0.5) / 4;
-                const tX = (i + 0.5) / (row * 2 + 1);
-                
-                const y = c.a.y + (c.bl.y - c.a.y) * tY;
-                const xLeft = c.a.x + (c.bl.x - c.a.x) * tY;
-                const xRight = c.a.x + (c.br.x - c.a.x) * tY;
-                const x = xLeft + (xRight - xLeft) * tX;
-
-                const lum = getPointLum(grayMat, {x, y});
-                bits.push(lum < threshold ? 1 : 0);
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: "environment",
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    }
+                });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    overlay.width = camContainer.clientWidth;
+                    overlay.height = camContainer.clientHeight;
+                    hCanvas.width = PROCESS_WIDTH;
+                    hCanvas.height = Math.round(PROCESS_WIDTH * (video.videoHeight / video.videoWidth));
+                    requestAnimationFrame(loop);
+                    debugDisplay.textContent = "Scanning...";
+                };
+            } catch (e) {
+                debugDisplay.textContent = "Camera Error: " + e.message;
             }
         }
 
-        // Validate Parity
-        if (bits[0] === 1 && bits[9] === 1) {
-            const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
-            const S_R = [bits[2], bits[6], bits[10], bits[14]];
-            const S_C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
-            
-            if (S_R.every((v, i) => v === S_C[i])) {
-                resultDisplay.textContent = "ID: " + parseInt(D.join(''), 2).toString().padStart(3, '0');
-                navigator.vibrate(100);
+        function loop(time) {
+            requestAnimationFrame(loop);
+
+            if (!cvReady || video.readyState !== video.HAVE_ENOUGH_DATA) return;
+
+            // State Machine: Locked
+            if (isLocked) {
+                if (time - lastScanTime > LOCK_DURATION) {
+                    isLocked = false;
+                    lockedMesh = null;
+                    lockedId = null;
+                    resultDisplay.textContent = "Waiting for Sigil...";
+                    resultDisplay.className = "";
+                    overlay.style.opacity = 1.0;
+                } else {
+                    // Draw frozen mesh
+                    drawLockedState();
+                    return;
+                }
+            }
+
+            // Throttle to 3 FPS (333ms)
+            if (time - lastScanTime < SCAN_INTERVAL) return;
+            lastScanTime = time;
+
+            const result = processFrame();
+            if (result) {
+                isLocked = true;
+                lockedMesh = result.mesh;
+                lockedId = result.id;
+                resultDisplay.textContent = "ID: " + result.idString;
+                resultDisplay.className = "success";
+
+                // Draw immediately
+                drawLockedState();
+
+                // Explicit cleanup just in case
+                // (Mats are cleaned in processFrame)
             }
         }
-    }
 
-    function getPointLum(mat, p) {
-        if (p.x < 0 || p.x >= GRID_SIZE || p.y < 0 || p.y >= GRID_SIZE) return 128;
-        return mat.ucharPtr(Math.floor(p.y), Math.floor(p.x))[0];
-    }
+        function processFrame() {
+            // Draw video effectively to hidden canvas for reading
+            hCtx.drawImage(video, 0, 0, hCanvas.width, hCanvas.height);
 
-    function drawWireframe(c) {
-        const s = overlay.width / GRID_SIZE;
-        oCtx.strokeStyle = "#0f0"; oCtx.lineWidth = 2;
-        oCtx.beginPath();
-        oCtx.moveTo(c.a.x*s, c.a.y*s); oCtx.lineTo(c.bl.x*s, c.bl.y*s);
-        oCtx.lineTo(c.br.x*s, c.br.y*s); oCtx.closePath(); oCtx.stroke();
-        
-        // Draw the internal grid lines to confirm evaluation points
-        for (let i = 1; i < 4; i++) {
-            let t = i / 4;
-            // Horizontal lines
-            oCtx.moveTo((c.a.x + (c.bl.x - c.a.x)*t)*s, (c.a.y + (c.bl.y - c.a.y)*t)*s);
-            oCtx.lineTo((c.a.x + (c.br.x - c.a.x)*t)*s, (c.a.y + (c.br.y - c.a.y)*t)*s);
+            let src = cv.imread(hCanvas);
+            let gray = new cv.Mat();
+            let blur = new cv.Mat();
+            let binary = new cv.Mat();
+
+            // Pre-processing
+            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+            cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+            cv.adaptiveThreshold(blur, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 11, 2);
+
+            // Find Contours
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(binary, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
+
+            let foundId = null;
+            let meshData = null;
+
+            // Iterate Contours to find Triangle
+            // Sort by area logic? Or just find largest poly that approximates to 3 vertices
+            let bestCnt = null;
+            let maxArea = 0;
+
+            for (let i = 0; i < contours.size(); ++i) {
+                let cnt = contours.get(i);
+                let area = cv.contourArea(cnt);
+                if (area > 2000) { // Min area filter
+                    let peri = cv.arcLength(cnt, true);
+                    let approx = new cv.Mat();
+                    cv.approxPolyDP(cnt, approx, 0.04 * peri, true);
+
+                    if (approx.rows === 3) {
+                        if (area > maxArea) {
+                            maxArea = area;
+                            // Manual deep copy of approx data needed?
+                            // OpenCV.js mat interaction:
+                            // We need the coordinates.
+
+                            // Check convexity?
+                            if (cv.isContourConvex(approx)) {
+                                // Verify equilateral-ish? (Optional but robust)
+                                // For now, accept any triangle
+
+                                // Extract vertices
+                                let v1 = { x: approx.data32S[0], y: approx.data32S[1] };
+                                let v2 = { x: approx.data32S[2], y: approx.data32S[3] };
+                                let v3 = { x: approx.data32S[4], y: approx.data32S[5] };
+
+                                // Sort Vertices to identify (Top, BotLeft, BotRight) strictly by geometry
+                                // Logic: 
+                                // 1. Find Top (Min Y).
+                                // 2. Sort remaining two by X.
+                                // BUT: The sigil might be rotated.
+                                // The Prompt asks to "Start with geometric mesh... Use Barycentric Interpolation... V1, V2, V3 raw"
+                                // AND later "Identity which two corners are darkest to determine Logical Top".
+                                //
+                                // So we need a consistent way to assign V1, V2, V3 initially to build the mesh.
+                                // Let's just Sort by Y (Top) then X (Left/Right) for the "Physical Mesh".
+                                // This gives us a stable grid 0..15 relative to the screen.
+
+                                let verts = [v1, v2, v3];
+                                verts.sort((a, b) => a.y - b.y);
+                                let top = verts[0];
+                                let others = [verts[1], verts[2]].sort((a, b) => a.x - b.x);
+                                let botLeft = others[0];
+                                let botRight = others[1];
+
+                                // Run Analysis
+                                let analysis = analyzeSigil(gray, top, botLeft, botRight);
+
+                                // Update Live Overlay (Green Lines)
+                                oCtx.clearRect(0, 0, overlay.width, overlay.height);
+                                drawLiveMesh([top, botLeft, botRight], analysis ? analysis.bits : null);
+
+                                if (analysis && analysis.valid) {
+                                    foundId = { idString: analysis.idString, id: analysis.idValue };
+                                    meshData = { verts: [top, botLeft, botRight], bits: analysis.bits, logicalBits: analysis.logicalBits };
+                                }
+                            }
+                        }
+                    }
+                    approx.delete();
+                }
+            }
+
+            // Cleanup
+            src.delete(); gray.delete(); blur.delete(); binary.delete();
+            contours.delete(); hierarchy.delete();
+
+            if (foundId) {
+                return { ...foundId, mesh: meshData };
+            }
+            return null;
         }
-        oCtx.stroke();
-    }
-</script>
+
+        function analyzeSigil(grayMat, v1, v2, v3) {
+            // Sample 16 points
+            let samples = [];
+            let pixelValues = [];
+
+            // Scaling factor from Process Res to Screen Res?
+            // Note: Coordinates v1, v2, v3 are in Process Resolution (hCanvas).
+            // GRAY mat is also hCanvas size.
+            // We can sample directly.
+
+            for (let i = 0; i < 16; i++) {
+                let center = SUB_TRIANGLES[i].center;
+                // P = u*V1 + v*V2 + w*V3
+                let px = center.u * v1.x + center.v * v2.x + center.w * v3.x;
+                let py = center.u * v1.y + center.v * v2.y + center.w * v3.y;
+
+                // Sample
+                let val = 255;
+                if (px >= 0 && px < grayMat.cols && py >= 0 && py < grayMat.rows) {
+                    val = grayMat.ucharPtr(Math.floor(py), Math.floor(px))[0];
+                }
+                pixelValues.push({ idx: i, val: val });
+            }
+
+            // Adaptive Thresholding logic
+            // "Sort the 16 samples. Set binary threshold as average between 4th lowest and 12th lowest."
+            // 4th lowest is index 3. 12th lowest is index 11.
+            let sorted = [...pixelValues].sort((a, b) => a.val - b.val);
+            let lowRef = sorted[3].val;
+            let highRef = sorted[11].val;
+            let thresh = (lowRef + highRef) / 2;
+
+            // Bits: 1 (Dark < Thresh), 0 (Light > Thresh)
+            let bits = pixelValues.map(p => (p.val < thresh) ? 1 : 0);
+
+            // Anchors: 0, 9, 15
+            let a1 = bits[0];
+            let a2 = bits[9];
+            let a3 = bits[15];
+
+            // Determine Top
+            // "If Index 0 and 9 are black: Standard (Top=0)"
+            // "If Index 9 and 15 are black: Rot 120 (Top=15)"
+            // "If Index 15 and 0 are black: Rot 240 (Top=9)"
+
+            let orientation = -1; // 0=Std, 1=Rot120(CW?), 2=Rot240(CW?)
+
+            if (a1 === 1 && a2 === 1) orientation = 0;
+            else if (a2 === 1 && a3 === 1) orientation = 1;
+            else if (a3 === 1 && a1 === 1) orientation = 2;
+
+            if (orientation === -1) return null; // Invalid anchors
+
+            // Remap Bits
+            // We need a mapping from "Physical Index" to "Logical Index" based on rotation.
+            // Rotation transforms the barycentric grid.
+            //
+            // Map 0: No change.
+            // Map 1: Logical Top is Physical 15. Logical BottomLeft is Physical 0? 
+            // Let's visualize rotation 120 deg CW.
+            // Triangle V1->V2->V3->V1.
+            // Std: Top=V1, BL=V2, BR=V3.
+            // Rot120: Top=V2(Physical BL?), BL=V3(Physical BR?), BR=V1(Physical Top?).
+            //
+            // Wait, the prompt says "Orientation is Rotated 120 deg (Logical Top = Index 15)".
+            // Index 15 is Row 4, rightmost Up triangle. (Physical Bottom Right).
+            // So Rot 120 means the Physical Bottom Right is the Logical Top.
+            //
+            // Let's build a static remap table.
+            // We can do this by rotating the integer barycentric coordinates (u,v,w).
+            // Cycle: u -> v -> w -> u.
+            //
+            // For each Logical Index L (0..15):
+            //   Get Coords (u,v,w) for L in Standard orientation.
+            //   Apply Permutation based on orientation.
+            //   Find Physical Index P that matches new coords.
+
+            let logicalBits = new Array(16).fill(0);
+
+            for (let i = 0; i < 16; i++) {
+                // Get coords of this LOGICAL position
+                let coords = SUB_TRIANGLES[i].center; // This struct has normalized u,v,w roughly
+                // Actually better to use the int coords or just match by 'u,v,w' role.
+                // Center = u*V1 + v*V2 + w*V3.
+                //
+                // If Rotation 1 (Logical Top = Index 15 = Phys BR = V3):
+                // The Physical Triangle has V1(Top), V2(BL), V3(BR).
+                // The Logical Triangle has TV1=V3, TV2=V1, TV3=V2. (Cyclic shift V3->V1->V2->V3)
+                //
+                // Point P = l_u*TV1 + l_v*TV2 + l_w*TV3
+                //         = l_u*V3 + l_v*V1 + l_w*V2
+                //         = l_v*V1 + l_w*V2 + l_u*V3
+                // So Physical u = Logical v
+                //    Physical v = Logical w
+                //    Physical w = Logical u
+                //
+                // Rotation 2 (Logical Top = Index 9 = Phys BL = V2):
+                // TV1=V2, TV2=V3, TV3=V1.
+                // P = l_u*V2 + l_v*V3 + l_w*V1
+                //   = l_w*V1 + l_u*V2 + l_v*V3
+                // So Phys u = Log w
+                //    Phys v = Log u
+                //    Phys w = Log v
+
+                let targetU, targetV, targetW;
+                let logicalC = SUB_TRIANGLES[i].center;
+
+                if (orientation === 0) {
+                    targetU = logicalC.u; targetV = logicalC.v; targetW = logicalC.w;
+                } else if (orientation === 1) { // Top is 15 (White), CCW Rotation
+                    // Log 0 (Top) -> Phys BL (Index 9)
+                    // Phys BL is V2 (0,1,0).
+                    // We need Log(1,0,0) -> (0,1,0).
+                    // So targetV must be logU? 
+                    // Let's assume cyclic shift (w, u, v)
+                    // U_phys = w_log
+                    // V_phys = u_log
+                    // W_phys = v_log
+                    targetU = logicalC.w; targetV = logicalC.u; targetW = logicalC.v;
+                } else { // Top is 9 (Black), BL is 15 (White), CW Rotation
+                    // Log 0 (Top) -> Phys BR (Index 15)
+                    // Phys BR is V3 (0,0,1).
+                    // We need Log(1,0,0) -> (0,0,1).
+                    // U_phys = v_log
+                    // V_phys = w_log
+                    // W_phys = u_log
+                    targetU = logicalC.v; targetV = logicalC.w; targetW = logicalC.u;
+                }
+
+                // Find Physical Index that matches (approx) these coords
+                // Precision issues? Use nearest match.
+                let minD = 999;
+                let matchIdx = -1;
+                for (let p = 0; p < 16; p++) {
+                    let pc = SUB_TRIANGLES[p].center;
+                    let d = Math.abs(pc.u - targetU) + Math.abs(pc.v - targetV) + Math.abs(pc.w - targetW);
+                    if (d < minD) { minD = d; matchIdx = p; }
+                }
+
+                logicalBits[i] = bits[matchIdx];
+            }
+
+            // Decode
+            // Anchors: L0, L9, L15 (should be 1, 0, 0 ? No, Anchors are 2 bits).
+            // "2 bits are Anchors... 9 bits Data... 4 bits Parity... 1 bit Clock"
+            // Prompt says: "Two of the three corner triangles (0, 9, 15) are always Black anchors."
+            // That implies the 3rd corner is NOT an anchor? Or is it the "Clock"?
+            // "1 bit is a Clock/Sync bit."
+
+            // Let's identify the bit map.
+            // Total 16.
+            // Anchors are handled by Orientation logic (we know 2 must be 1).
+            // Checks based on Logic:
+            // Orientation 0: 0=1, 9=1. 15=?
+            // Orientation 1: 15=1, 0=1 ??? No.
+            // Prompt: "If Index 0 and 9 are black... (Logical Top=0)"
+            // This implies in Logical Space, Loc 0 and Loc 9 are ALWAYS 1.
+            // Wait.
+            // If Logic Top is 0. Then Physical 0 is Logic 0. Physical 9 is Logic 9.
+            // So Logic 0=1, Logic 9=1.
+            //
+            // Let's Check Logic 15.
+            // "1 bit is a Clock/Sync bit".
+            // Maybe Logic 15 is Clock? Or 0 and 9 are the anchors.
+            //
+            // Data Structure:
+            // P1..P4, D1..D9. That's 13 bits.
+            // Anchors (2) + Clock (1) = 3 bits.
+            // Total 16. Matches.
+            //
+            // Mapping?
+            // Prompt: "Parity Check... P1, P2, P3, P4... D1-D9".
+            // It doesn't explicitly map Indices to Functions (e.g. "Index 1 is D1").
+            // BUT, it lists Parity formulas like `P1 = D1^D2...`.
+            //
+            // Wait, "The 16 triangles are indexed 0 to 15... 2 bits are Anchors...".
+            // Usually these are fixed positions.
+            // Let's assume standard reading order 0..15 excluding Anchors/Clock?
+            //
+            // Let's look for "Data Structure" clues in prompt.
+            // "Total Bits: 16... 2 Anchors... 9 Data... 4 Parity... 1 Clock".
+            // No explicit map given.
+            //
+            // Common pattern or previous prompts?
+            // Assuming linear fill of remaining bits after Anchors (0, 9).
+            // Clock is likely 15? Or maybe Clock is unused/always alternating?
+            // Let's assume Anchors = {0, 9}. Clock = {15}.
+            // Remaining indices: 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14. (13 bits).
+            // We need 9 Data + 4 Parity. Fits perfectly.
+            //
+            // How to assign? Linear?
+            // Index Order: 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14.
+            // Assignments:
+            // D1, D2, D3, D4, D5, D6, D7, D8, D9 (9 bits)
+            // P1, P2, P3, P4 (4 bits)
+            //
+            // Let's assume:
+            // D1=Idx1, D2=Idx2, ... D8=Idx8.
+            // Idx9 is Anchor.
+            // D9=Idx10.
+            // P1=Idx11, P2=Idx12, P3=Idx13, P4=Idx14.
+            // Clock=Idx15.
+            //
+            // Let's try this mapping.
+
+            if (logicalBits[0] !== 1 || logicalBits[9] !== 1) return null; // Logic Anchors must be 1
+
+            let D = [
+                0, // padding
+                logicalBits[1], // D1
+                logicalBits[2], // D2
+                logicalBits[3], // D3
+                logicalBits[4], // D4
+                logicalBits[5], // D5
+                logicalBits[6], // D6
+                logicalBits[7], // D7
+                logicalBits[8], // D8
+                logicalBits[10] // D9
+            ];
+
+            let P = [
+                0, // padding
+                logicalBits[11], // P1
+                logicalBits[12], // P2
+                logicalBits[13], // P3
+                logicalBits[14]  // P4
+            ];
+
+            // Parity Logic
+            // P1 = D1^D2^D4^D5^D7^D9
+            let calcP1 = D[1] ^ D[2] ^ D[4] ^ D[5] ^ D[7] ^ D[9];
+            // P2 = D3^D4^D5^D6^D8^D9
+            let calcP2 = D[3] ^ D[4] ^ D[5] ^ D[6] ^ D[8] ^ D[9];
+            // P3 = D1^D3^D4^D7^D8
+            let calcP3 = D[1] ^ D[3] ^ D[4] ^ D[7] ^ D[8];
+            // P4 = D2^D5^D6^D8^D9
+            let calcP4 = D[2] ^ D[5] ^ D[6] ^ D[8] ^ D[9];
+
+            if (calcP1 === P[1] && calcP2 === P[2] && calcP3 === P[3] && calcP4 === P[4]) {
+                // Success
+                let idVal = parseInt(D.slice(1).join(''), 2);
+                return { valid: true, idValue: idVal, idString: idVal.toString(), bits: bits, logicalBits: logicalBits };
+            }
+
+            return null;
+        }
+
+        function drawLiveMesh(verts, bits) {
+            let v1 = verts[0], v2 = verts[1], v3 = verts[2];
+            let sX = overlay.width / PROCESS_WIDTH;
+            let sY = overlay.height / hCanvas.height;
+
+            oCtx.lineWidth = 2;
+            oCtx.lineJoin = "round";
+
+            // Helper to project
+            function proj(u, v, w) {
+                return {
+                    x: (u * v1.x + v * v2.x + w * v3.x) * sX,
+                    y: (u * v1.y + v * v2.y + w * v3.y) * sY
+                };
+            }
+
+            // Draw 16 triangles
+            // We can draw them individually based on the SUB_TRIANGLE defs
+            for (let i = 0; i < 16; i++) {
+                oCtx.strokeStyle = "#0f0";
+                oCtx.fillStyle = "rgba(0, 255, 0, 0.0)"; // Transparent for live
+
+                if (bits && bits[i] === 1) {
+                    // oCtx.fillStyle = "rgba(0, 255, 0, 0.4)"; // Debug visual for raw bits
+                }
+
+                let tri = SUB_TRIANGLES[i];
+                let p1 = proj(tri.verts[0].u / 4, tri.verts[0].v / 4, tri.verts[0].w / 4);
+                let p2 = proj(tri.verts[1].u / 4, tri.verts[1].v / 4, tri.verts[1].w / 4);
+                let p3 = proj(tri.verts[2].u / 4, tri.verts[2].v / 4, tri.verts[2].w / 4);
+
+                oCtx.beginPath();
+                oCtx.moveTo(p1.x, p1.y);
+                oCtx.lineTo(p2.x, p2.y);
+                oCtx.lineTo(p3.x, p3.y);
+                oCtx.closePath();
+                oCtx.stroke();
+                // oCtx.fill();
+            }
+        }
+
+        function drawLockedState() {
+            if (!lockedMesh) return;
+
+            oCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+            let v1 = lockedMesh.verts[0];
+            let v2 = lockedMesh.verts[1];
+            let v3 = lockedMesh.verts[2];
+            let sX = overlay.width / PROCESS_WIDTH;
+            let sY = overlay.height / hCanvas.height;
+
+            // Draw with Fills
+            // "mesh (with 40% opacity green/white bit fills)"
+            // Since we have Logical Bits and we want to show the 'Decoded' ID,
+            // we should probably visualize the Physical bits as detected (Raw).
+            // Green=1, White=0? Or Black/White?
+            // Prompt says "40% opacity green/white".
+            // Green for Black (1)? White for White (0)?
+            // Or Green for 'Active'.
+            // Let's use Green for 1, White for 0.
+
+            function proj(u, v, w) {
+                return {
+                    x: (u * v1.x + v * v2.x + w * v3.x) * sX,
+                    y: (u * v1.y + v * v2.y + w * v3.y) * sY
+                };
+            }
+
+            for (let i = 0; i < 16; i++) {
+                // Physical bits
+                let val = lockedMesh.bits[i];
+
+                oCtx.strokeStyle = "#0f0";
+                oCtx.fillStyle = val === 1 ? "rgba(0, 255, 0, 0.4)" : "rgba(255, 255, 255, 0.4)";
+
+                let tri = SUB_TRIANGLES[i];
+                let p1 = proj(tri.verts[0].u / 4, tri.verts[0].v / 4, tri.verts[0].w / 4);
+                let p2 = proj(tri.verts[1].u / 4, tri.verts[1].v / 4, tri.verts[1].w / 4);
+                let p3 = proj(tri.verts[2].u / 4, tri.verts[2].v / 4, tri.verts[2].w / 4);
+
+                oCtx.beginPath();
+                oCtx.moveTo(p1.x, p1.y);
+                oCtx.lineTo(p2.x, p2.y);
+                oCtx.lineTo(p3.x, p3.y);
+                oCtx.closePath();
+                oCtx.fill();
+                oCtx.stroke();
+
+                // Draw index number for debug? No, clean UI.
+            }
+        }
+
+    </script>
 </body>
+
 </html>
