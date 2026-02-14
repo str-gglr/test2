@@ -1,10 +1,12 @@
 body {
     margin: 0;
     padding: 0;
-    background-color: #0f0f13; /* Very dark blue-gray */
+    background-color: #0f0f13;
+    /* Very dark blue-gray */
     color: #e0e0e0;
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
-    overflow: hidden; /* Prevent scrolling */
+    overflow: hidden;
+    /* Prevent scrolling */
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -16,7 +18,8 @@ body {
     position: relative;
     width: 100%;
     height: 100%;
-    max-width: 600px; /* Mobile first logic */
+    max-width: 600px;
+    /* Mobile first logic */
     display: flex;
     flex-direction: column;
 }
@@ -39,7 +42,8 @@ body {
     left: 0;
     width: 100%;
     height: 100%;
-    pointer-events: none; /* Let clicks pass through */
+    pointer-events: none;
+    /* Let clicks pass through */
     display: flex;
     flex-direction: column;
     justify-content: space-between;
@@ -105,7 +109,8 @@ body {
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.8rem;
     color: #00ff9d;
-    display: none; /* Hidden by default until detect */
+    display: none;
+    /* Hidden by default until detect */
     transition: all 0.3s ease;
 }
 
@@ -145,10 +150,23 @@ body {
 }
 
 @keyframes scan {
-    0% { transform: translateY(-150px); opacity: 0; }
-    20% { opacity: 0.8; }
-    80% { opacity: 0.8; }
-    100% { transform: translateY(150px); opacity: 0; }
+    0% {
+        transform: translateY(-150px);
+        opacity: 0;
+    }
+
+    20% {
+        opacity: 0.8;
+    }
+
+    80% {
+        opacity: 0.8;
+    }
+
+    100% {
+        transform: translateY(150px);
+        opacity: 0;
+    }
 }
 
 /* Landscape adjustments */
