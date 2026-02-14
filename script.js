@@ -1,16 +1,12 @@
 
-let utils = undefined;
 let streaming = false;
 let videoInput = document.getElementById('videoInput');
 let canvasOutput = document.getElementById('canvasOutput');
-let canvasContext = canvasOutput.getContext('2d');
 let stream = null;
 let cap = null;
 let src = null;
 let dst = null;
 let gray = null;
-let contours = null;
-let hierarchy = null;
 
 // Constants for Sigil Processing
 const SIGIL_ROWS = 4;
@@ -113,6 +109,34 @@ function onOpenCvReady() {
 }
 
 function startCamera() {
+    console.log('startCamera called');
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        console.error('getUserMedia is not supported — are you on HTTPS or localhost?');
+        document.getElementById('status-text').innerHTML = "Camera Not Supported";
+        return;
+    }
+
+    // Set up the metadata handler BEFORE requesting the stream
+    videoInput.onloadedmetadata = function () {
+        console.log('Video metadata loaded:', videoInput.videoWidth, 'x', videoInput.videoHeight);
+        document.getElementById('status-text').innerHTML = "System Ready";
+        document.getElementById('status-dot').className = 'status-dot active';
+
+        videoInput.width = videoInput.videoWidth;
+        videoInput.height = videoInput.videoHeight;
+
+        canvasOutput.width = videoInput.videoWidth;
+        canvasOutput.height = videoInput.videoHeight;
+
+        cap = new cv.VideoCapture(videoInput);
+        src = new cv.Mat(videoInput.height, videoInput.width, cv.CV_8UC4);
+        gray = new cv.Mat();
+        dst = new cv.Mat();
+
+        requestAnimationFrame(processVideo);
+    };
+
     navigator.mediaDevices.getUserMedia({
         video: {
             facingMode: 'environment',
@@ -122,27 +146,15 @@ function startCamera() {
         audio: false
     })
         .then(function (s) {
+            console.log('Camera stream acquired');
             stream = s;
             videoInput.srcObject = stream;
             videoInput.play();
         })
         .catch(function (err) {
-            console.log("An error occurred! " + err);
-            document.getElementById('status-text').innerHTML = "Camera Error";
+            console.error('Camera error:', err);
+            document.getElementById('status-text').innerHTML = "Camera Error: " + err.message;
         });
-
-    videoInput.onloadedmetadata = function (e) {
-        document.getElementById('status-text').innerHTML = "System Ready";
-        videoInput.width = videoInput.videoWidth;
-        videoInput.height = videoInput.videoHeight;
-        cap = new cv.VideoCapture(videoInput);
-
-        src = new cv.Mat(videoInput.height, videoInput.width, cv.CV_8UC4);
-        gray = new cv.Mat();
-        dst = new cv.Mat(); // For rendering
-
-        requestAnimationFrame(processVideo);
-    };
 }
 
 function processVideo() {
