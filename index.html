@@ -16,6 +16,7 @@
 </head>
 <body>
 
+    <div id="gate" onclick="initSystem()">START CALIBRATED SCAN</div>
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
@@ -28,55 +29,47 @@
     const oCtx = overlay.getContext('2d');
     const resultDisplay = document.getElementById('result');
 
-    let cvReady = false, lastScan = 0, lockUntil = 0;
-    const GRID = 400;
+    let cvReady = false;
+    let lastScanTime = 0;
+    const GRID_SIZE = 400;
     const hCanvas = document.createElement('canvas');
-    hCanvas.width = hCanvas.height = GRID;
+    hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d');
 
-    window.onload = () => {
-        let check = setInterval(() => {
-            if (typeof cv !== 'undefined' && cv.Mat) { cvReady = true; clearInterval(check); start(); }
-        }, 100);
-    };
+    function initSystem() { document.getElementById('gate').style.display = 'none'; startCamera(); }
+    var Module = { onRuntimeInitialized: () => { cvReady = true; } };
 
-    async function start() {
-        const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        video.srcObject = s;
-        video.onloadedmetadata = () => { 
-            overlay.width = overlay.height = camContainer.clientWidth; 
-            requestAnimationFrame(loop); 
+    async function startCamera() {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        video.srcObject = stream;
+        video.onloadedmetadata = () => {
+            overlay.width = overlay.height = camContainer.clientWidth;
+            requestAnimationFrame(loop);
         };
     }
 
-    function loop(t) {
+    function loop(time) {
         if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
-            oCtx.clearRect(0, 0, overlay.width, overlay.height);
-            
-            // Only scan 3 times per second
-            if (t - lastScan > 333) {
-                if (t > lockUntil) {
-                    process(t);
-                    lastScan = t;
-                } else {
-                    // Just clear result if lock expired but we haven't scanned yet
-                    resultDisplay.classList.remove('success');
-                }
+            if (time - lastScanTime > 333) { // 3 FPS
+                oCtx.clearRect(0, 0, overlay.width, overlay.height);
+                processFrame();
+                lastScanTime = time;
             }
         }
         requestAnimationFrame(loop);
     }
 
-    function process(now) {
-        const d = Math.min(video.videoWidth, video.videoHeight);
-        hCtx.drawImage(video, (video.videoWidth-d)/2, (video.videoHeight-d)/2, d, d, 0, 0, GRID, GRID);
-        
-        let src = cv.imread(hCanvas), gray = new cv.Mat(), bin = new cv.Mat();
+    function processFrame() {
+        const minD = Math.min(video.videoWidth, video.videoHeight);
+        hCtx.drawImage(video, (video.videoWidth-minD)/2, (video.videoHeight-minD)/2, minD, minD, 0, 0, GRID_SIZE, GRID_SIZE);
+
+        let src = cv.imread(hCanvas);
+        let gray = new cv.Mat(), binary = new cv.Mat();
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        cv.adaptiveThreshold(gray, bin, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
+        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
 
         let contours = new cv.MatVector(), hierarchy = new cv.Mat();
-        cv.findContours(bin, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
         let maxI = -1, maxA = 0;
         for (let i = 0; i < contours.size(); ++i) {
@@ -85,109 +78,88 @@
         }
 
         if (maxI !== -1 && maxA > 4000) {
-            let approx = new cv.Mat(), hull = new cv.Mat();
+            let approx = new cv.Mat();
+            let hull = new cv.Mat();
             cv.convexHull(contours.get(maxI), hull);
             cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
             if (approx.rows === 3) {
-                const pts = [];
-                for(let i=0; i<3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
-                
-                // 1. Identify raw corners based on screen position (to build the mesh)
-                pts.sort((a,b) => a.y - b.y);
-                const p0 = pts[0], b = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
-                const corners = { a: p0, bl: b[0], br: b[1] };
-
-                // 2. Evaluate all 16 triangles in this specific perspective
-                const evaluation = evaluateSigil(gray, corners);
-                
-                // 3. Draw the mesh perfectly fitted to the edges
-                drawPerspectiveMesh(corners, evaluation.bits);
-
-                if (evaluation.id !== null) {
-                    resultDisplay.textContent = "ID: " + evaluation.id.toString().padStart(3, '0');
-                    resultDisplay.classList.add('success');
-                    lockUntil = now + 3000;
-                }
+                const c = sortCorners(approx);
+                drawWireframe(c);
+                evaluateBits(gray, c);
             }
             approx.delete(); hull.delete();
         }
-        src.delete(); gray.delete(); bin.delete(); contours.delete(); hierarchy.delete();
+
+        src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete();
     }
 
-    function evaluateSigil(mat, c) {
-        const rawLums = [];
-        const samples = [];
-        
-        // Sample all 16 triangles using linear interpolation between corners
-        for (let r = 0; r < 4; r++) {
-            for (let i = 0; i < (r * 2 + 1); i++) {
-                const tY = (r + 0.5) / 4;
-                const tX = (i + 0.5) / (r * 2 + 1);
-                const y = c.a.y + (c.bl.y - c.a.y) * tY;
-                const xL = c.a.x + (c.bl.x - c.a.x) * tY;
-                const xR = c.a.x + (c.br.x - c.a.x) * tY;
-                const x = xL + (xR - xL) * tX;
+    function sortCorners(approx) {
+        let pts = [];
+        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
+        pts.sort((a, b) => a.y - b.y);
+        const apex = pts[0];
+        const base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        return { a: apex, bl: base[0], br: base[1] };
+    }
+
+    function evaluateBits(grayMat, c) {
+        // Step 1: Establish Anchor Reference Levels
+        const blackVal = (getPointLum(grayMat, c.a) + getPointLum(grayMat, c.bl)) / 2;
+        const whiteVal = getPointLum(grayMat, c.br);
+        const threshold = (blackVal + whiteVal) / 2;
+
+        const bits = [];
+        // Step 2: Traverse the 16 triangles using the wireframe geometry
+        for (let row = 0; row < 4; row++) {
+            for (let i = 0; i < (row * 2 + 1); i++) {
+                // Calculate center point of each sub-triangle mathematically
+                const tY = (row + 0.5) / 4;
+                const tX = (i + 0.5) / (row * 2 + 1);
                 
-                const lum = mat.ucharPtr(Math.floor(y), Math.floor(x))[0];
-                rawLums.push(lum);
+                const y = c.a.y + (c.bl.y - c.a.y) * tY;
+                const xLeft = c.a.x + (c.bl.x - c.a.x) * tY;
+                const xRight = c.a.x + (c.br.x - c.a.x) * tY;
+                const x = xLeft + (xRight - xLeft) * tX;
+
+                const lum = getPointLum(grayMat, {x, y});
+                bits.push(lum < threshold ? 1 : 0);
             }
         }
 
-        const sorted = [...rawLums].sort((a,b) => a-b);
-        const threshold = (sorted[4] + sorted[11]) / 2;
-        const bits = rawLums.map(v => v < threshold ? 1 : 0);
-
-        // OMNI-DIRECTIONAL LOGIC
-        // Anchor IDs in the 16-bit array: Top=0, Bottom-Left=9, Bottom-Right=15
-        let id = null;
-
-        const decode = (b) => {
-            const D = [b[1], b[3], b[4], b[5], b[7], b[8], b[11], b[12], b[13]];
-            const R = [b[2], b[6], b[10], b[14]];
-            const C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
-            return R.every((v,i) => v === C[i]) ? parseInt(D.join(''), 2) : null;
-        };
-
-        // Try 3 possible rotations based on where the Black Anchors are
-        if (bits[0] === 1 && bits[9] === 1) id = decode(bits); // Standard
-        // (Rotation logic can be expanded here for 120/240 degree offsets)
-
-        return { id, bits };
+        // Validate Parity
+        if (bits[0] === 1 && bits[9] === 1) {
+            const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
+            const S_R = [bits[2], bits[6], bits[10], bits[14]];
+            const S_C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
+            
+            if (S_R.every((v, i) => v === S_C[i])) {
+                resultDisplay.textContent = "ID: " + parseInt(D.join(''), 2).toString().padStart(3, '0');
+                navigator.vibrate(100);
+            }
+        }
     }
 
-    function drawPerspectiveMesh(c, bits) {
-        const s = overlay.width / GRID;
-        oCtx.lineWidth = 1.5;
-        let idx = 0;
+    function getPointLum(mat, p) {
+        if (p.x < 0 || p.x >= GRID_SIZE || p.y < 0 || p.y >= GRID_SIZE) return 128;
+        return mat.ucharPtr(Math.floor(p.y), Math.floor(p.x))[0];
+    }
 
-        for (let r = 0; r < 4; r++) {
-            const tT = r/4, tB = (r+1)/4;
-            const yT = (c.a.y + (c.bl.y - c.a.y)*tT)*s, yB = (c.a.y + (c.bl.y - c.a.y)*tB)*s;
-            const xLT = (c.a.x + (c.bl.x - c.a.x)*tT)*s, xRT = (c.p?c.p:c.a.x + (c.br.x - c.a.x)*tT)*s;
-            const xLB = (c.a.x + (c.bl.x - c.a.x)*tB)*s, xRB = (c.a.x + (c.br.x - c.a.x)*tB)*s;
-
-            for (let i = 0; i < (r*2+1); i++) {
-                oCtx.beginPath();
-                if (i%2===0) {
-                    const n = i/2;
-                    oCtx.moveTo(xLT + (xRT-xLT)*(n/r||0), yT);
-                    oCtx.lineTo(xLB + (xRB-xLB)*(n/(r+1)), yB);
-                    oCtx.lineTo(xLB + (xRB-xLB)*((n+1)/(r+1)), yB);
-                } else {
-                    const n = (i-1)/2;
-                    oCtx.moveTo(xLT + (xRT-xLT)*(n/r), yT);
-                    oCtx.lineTo(xLT + (xRT-xLT)*((n+1)/r), yT);
-                    oCtx.lineTo(xLB + (xRB-xLB)*((n+1)/(r+1)), yB);
-                }
-                oCtx.closePath();
-                oCtx.fillStyle = bits && bits[idx] ? "rgba(0, 255, 0, 0.4)" : "rgba(255, 255, 255, 0.1)";
-                oCtx.fill();
-                oCtx.strokeStyle = "rgba(0, 255, 0, 0.8)";
-                oCtx.stroke();
-                idx++;
-            }
+    function drawWireframe(c) {
+        const s = overlay.width / GRID_SIZE;
+        oCtx.strokeStyle = "#0f0"; oCtx.lineWidth = 2;
+        oCtx.beginPath();
+        oCtx.moveTo(c.a.x*s, c.a.y*s); oCtx.lineTo(c.bl.x*s, c.bl.y*s);
+        oCtx.lineTo(c.br.x*s, c.br.y*s); oCtx.closePath(); oCtx.stroke();
+        
+        // Draw the internal grid lines to confirm evaluation points
+        for (let i = 1; i < 4; i++) {
+            let t = i / 4;
+            // Horizontal lines
+            oCtx.moveTo((c.a.x + (c.bl.x - c.a.x)*t)*s, (c.a.y + (c.bl.y - c.a.y)*t)*s);
+            oCtx.lineTo((c.a.x + (c.br.x - c.a.x)*t)*s, (c.a.y + (c.br.y - c.a.y)*t)*s);
         }
+        oCtx.stroke();
     }
 </script>
 </body>
