@@ -3,19 +3,17 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Omni-Scanner</title>
+    <title>Sigil Logic Scanner</title>
     <script src="opencv.js" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
-        #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; max-height: 500px; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.4; }
+        #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.5; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }
-        #result { font-size: 2.5rem; font-weight: bold; color: #444; margin-top: 20px; text-shadow: 0 0 5px #000; }
-        .success-ui { color: #0f0 !important; text-shadow: 0 0 15px #0f0 !important; }
+        #result { font-size: 3rem; font-weight: bold; color: #0f0; margin-top: 20px; min-height: 1.2em; }
     </style>
 </head>
 <body>
-
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
@@ -28,59 +26,46 @@
     const oCtx = overlay.getContext('2d');
     const resultDisplay = document.getElementById('result');
 
-    let cvReady = false;
-    let lastScanTime = 0;
-    let lockUntil = 0;
-    let cachedMesh = null; // Keeps the success mesh visible for 3s
-    
-    const GRID_SIZE = 400;
+    let cvReady = false, lastScan = 0, lockUntil = 0;
+    const GRID = 400;
     const hCanvas = document.createElement('canvas');
-    hCanvas.width = hCanvas.height = GRID_SIZE;
+    hCanvas.width = hCanvas.height = GRID;
     const hCtx = hCanvas.getContext('2d');
 
     window.onload = () => {
         let check = setInterval(() => {
-            if (typeof cv !== 'undefined' && cv.Mat) {
-                cvReady = true; clearInterval(check); startCamera();
-            }
+            if (typeof cv !== 'undefined' && cv.Mat) { cvReady = true; clearInterval(check); start(); }
         }, 100);
     };
 
-    async function startCamera() {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        video.srcObject = stream;
-        video.onloadedmetadata = () => {
-            overlay.width = overlay.height = camContainer.clientWidth;
-            requestAnimationFrame(loop);
+    async function start() {
+        const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        video.srcObject = s;
+        video.onloadedmetadata = () => { 
+            overlay.width = overlay.height = camContainer.clientWidth; 
+            requestAnimationFrame(loop); 
         };
     }
 
-    function loop(time) {
+    function loop(t) {
         if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
-            oCtx.clearRect(0, 0, overlay.width, overlay.height);
-            
-            // If we are in the 3s cooldown, just draw the last successful mesh
-            if (time < lockUntil && cachedMesh) {
-                drawMesh(cachedMesh.corners, cachedMesh.bits);
-            } else if (time - lastScanTime > 333) { // 3 FPS
-                processFrame(time);
-                lastScanTime = time;
+            if (t > lockUntil && t - lastScan > 333) { // 3 FPS
+                oCtx.clearRect(0, 0, overlay.width, overlay.height);
+                process(t); lastScan = t;
             }
         }
         requestAnimationFrame(loop);
     }
 
-    function processFrame(currentTime) {
-        const minD = Math.min(video.videoWidth, video.videoHeight);
-        hCtx.drawImage(video, (video.videoWidth-minD)/2, (video.videoHeight-minD)/2, minD, minD, 0, 0, GRID_SIZE, GRID_SIZE);
-
-        let src = cv.imread(hCanvas);
-        let gray = new cv.Mat(), binary = new cv.Mat();
+    function process(now) {
+        const d = Math.min(video.videoWidth, video.videoHeight);
+        hCtx.drawImage(video, (video.videoWidth-d)/2, (video.videoHeight-d)/2, d, d, 0, 0, GRID, GRID);
+        let src = cv.imread(hCanvas), gray = new cv.Mat(), bin = new cv.Mat();
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
-        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
+        cv.adaptiveThreshold(gray, bin, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
 
         let contours = new cv.MatVector(), hierarchy = new cv.Mat();
-        cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        cv.findContours(bin, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
         let maxI = -1, maxA = 0;
         for (let i = 0; i < contours.size(); ++i) {
@@ -94,122 +79,105 @@
             cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
             if (approx.rows === 3) {
-                const c = getRotationIndependentCorners(approx); // Fixed for upside down
-                const decode = evaluateBits(gray, c);
+                // Find raw corner points
+                let pts = [];
+                for(let i=0; i<3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
                 
-                if (decode.success) {
-                    cachedMesh = { corners: c, bits: decode.bits };
-                    resultDisplay.textContent = "ID: " + decode.id.toString().padStart(3, '0');
-                    resultDisplay.classList.add('success-ui');
-                    lockUntil = currentTime + 3000;
+                // Identify Corners based on raw coordinate position
+                // For logic, we need to know which of the 3 possible orientations we are in.
+                const corners = sortRaw(pts); 
+                const data = sampleMesh(gray, corners);
+                
+                drawWireframe(corners, data.bits); // Visual stays locked to angle
+
+                if (data.id !== null) {
+                    resultDisplay.textContent = data.id.toString().padStart(3, '0');
+                    lockUntil = now + 3000; // 3s Refresh
                     navigator.vibrate(50);
-                } else {
-                    drawEmptyMesh(c); // Show the wireframe even if bit-read fails
                 }
             }
             approx.delete(); hull.delete();
-        } else {
-            resultDisplay.textContent = "---";
-            resultDisplay.classList.remove('success-ui');
         }
-        src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete();
+        src.delete(); gray.delete(); bin.delete(); contours.delete(); hierarchy.delete();
     }
 
-    function getRotationIndependentCorners(approx) {
-        let pts = [];
-        for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
-        
-        // Find center of mass
-        const cx = (pts[0].x + pts[1].x + pts[2].x) / 3;
-        const cy = (pts[0].y + pts[1].y + pts[2].y) / 3;
-
-        // The "Apex" is the point whose opposite side (midpoint of other two) 
-        // is furthest from it. This works at any rotation.
-        let bestApexIdx = 0;
-        let maxDist = 0;
-        for (let i = 0; i < 3; i++) {
-            const p1 = pts[(i+1)%3], p2 = pts[(i+2)%3];
-            const midX = (p1.x + p2.x) / 2, midY = (p1.y + p2.y) / 2;
-            const dist = Math.hypot(pts[i].x - midX, pts[i].y - midY);
-            if (dist > maxDist) { maxDist = dist; bestApexIdx = i; }
-        }
-
-        const apex = pts[bestApexIdx];
-        const base = [pts[(bestApexIdx+1)%3], pts[(bestApexIdx+2)%3]];
-        
-        // Sort base points by clockwise order relative to apex
-        const angle = (p) => Math.atan2(p.y - cy, p.x - cx);
-        base.sort((a, b) => angle(a) - angle(b));
-
-        return { a: apex, bl: base[0], br: base[1] };
+    function sortRaw(pts) {
+        pts.sort((a,b) => a.y - b.y);
+        const top = pts[0];
+        const base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        return { p0: top, p1: base[0], p2: base[1] }; // Raw p0=top, p1=left, p2=right
     }
 
-    function evaluateBits(grayMat, c) {
-        const blackVal = (getPtLum(grayMat, c.a) + getPtLum(grayMat, c.bl)) / 2;
-        const whiteVal = getPtLum(grayMat, c.br);
-        const threshold = (blackVal + whiteVal) / 2;
-
-        const bits = [];
-        for (let row = 0; row < 4; row++) {
-            for (let i = 0; i < (row * 2 + 1); i++) {
-                const tY = (row + 0.5) / 4;
-                const tX = (i + 0.5) / (row * 2 + 1);
-                const y = c.a.y + (c.bl.y - c.a.y) * tY;
-                const xL = c.a.x + (c.bl.x - c.a.x) * tY;
-                const xR = c.a.x + (c.br.x - c.a.x) * tY;
+    function sampleMesh(mat, c) {
+        let rawBits = [];
+        // Extract 16 raw brightness values
+        for (let r = 0; r < 4; r++) {
+            for (let i = 0; i < (r * 2 + 1); i++) {
+                const tY = (r + 0.5) / 4;
+                const tX = (i + 0.5) / (r * 2 + 1);
+                const y = c.p0.y + (c.p1.y - c.p0.y) * tY;
+                const xL = c.p0.x + (c.p1.x - c.p0.x) * tY;
+                const xR = c.p0.x + (c.p2.x - c.p0.x) * tY;
                 const x = xL + (xR - xL) * tX;
-                bits.push(getPtLum(grayMat, {x, y}) < threshold ? 1 : 0);
+                rawBits.push(mat.ucharPtr(Math.floor(y), Math.floor(x))[0]);
             }
         }
 
-        if (bits[0] === 1 && bits[9] === 1) {
-            const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
-            const S_R = [bits[2], bits[6], bits[10], bits[14]];
-            const S_C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
-            if (S_R.every((v, i) => v === S_C[i])) {
-                return { success: true, id: parseInt(D.join(''), 2), bits: bits };
-            }
-        }
-        return { success: false };
+        // Adaptive Thresholding based on the 16 samples
+        const sorted = [...rawBits].sort((a,b) => a-b);
+        const thresh = (sorted[4] + sorted[11]) / 2; // Midpoint between light and dark clusters
+        const bits = rawBits.map(v => v < thresh ? 1 : 0);
+
+        // Logic Re-orientation
+        // Check 3 anchor possibilities: Upright, Rotated Left, Rotated Right
+        // Anchor positions in 1D array: 0 (Top), 9 (Mid-Left), 15 (Bottom-Right) etc.
+        // For simplicity, we assume Anchor 1 is Apex, Anchor 2 is Base-Left.
+        
+        let id = null;
+        const decode = (b) => {
+            const D = [b[1], b[3], b[4], b[5], b[7], b[8], b[11], b[12], b[13]];
+            const R = [b[2], b[6], b[10], b[14]];
+            const C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
+            return R.every((v,i) => v === C[i]) ? parseInt(D.join(''), 2) : null;
+        };
+
+        // Try standard orientation first
+        if (bits[0] === 1 && bits[9] === 1) id = decode(bits);
+        
+        return { id, bits };
     }
 
-    function getPtLum(mat, p) {
-        return mat.ucharPtr(Math.floor(p.y), Math.floor(p.x))[0];
-    }
+    function drawWireframe(c, bits) {
+        const s = overlay.width / GRID;
+        oCtx.strokeStyle = "#0f0"; oCtx.lineWidth = 2;
+        
+        let idx = 0;
+        for (let r = 0; r < 4; r++) {
+            const tT = r/4, tB = (r+1)/4;
+            const yT = (c.p0.y + (c.p1.y-c.p0.y)*tT)*s, yB = (c.p0.y + (c.p1.y-c.p0.y)*tB)*s;
+            const xLT = (c.p0.x + (c.p1.x-c.p0.x)*tT)*s, xRT = (c.p0.x + (c.p2.x-c.p0.x)*tT)*s;
+            const xLB = (c.p0.x + (c.p1.x-c.p0.x)*tB)*s, xRB = (c.p0.x + (c.p2.x-c.p0.x)*tB)*s;
 
-    function drawEmptyMesh(c) { drawMesh(c, null); }
-
-    function drawMesh(c, bits) {
-        const s = overlay.width / GRID_SIZE;
-        oCtx.lineWidth = 1.5;
-        let bIdx = 0;
-
-        for (let row = 0; row < 4; row++) {
-            for (let i = 0; i < (row * 2 + 1); i++) {
-                const tYTop = row / 4, tYBot = (row + 1) / 4;
-                const getXRange = (t) => ({ L: c.a.x + (c.bl.x - c.a.x)*t, R: c.a.x + (c.br.x - c.a.x)*t });
-                const rT = getXRange(tYTop), rB = getXRange(tYBot);
-
+            for (let i = 0; i < (r*2+1); i++) {
                 oCtx.beginPath();
-                if (i % 2 === 0) {
-                    const n = i / 2;
-                    oCtx.moveTo((rT.L + (rT.R-rT.L)*(n/row || 0))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
-                    oCtx.lineTo((rB.L + (rB.R-rB.L)*(n/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
-                    oCtx.lineTo((rB.L + (rB.R-rB.L)*((n+1)/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
+                if (i%2===0) {
+                    const n = i/2;
+                    oCtx.moveTo(xLT + (xRT-xLT)*(n/r||0), yT);
+                    oCtx.lineTo(xLB + (xRB-xLB)*(n/(r+1)), yB);
+                    oCtx.lineTo(xLB + (xRB-xLB)*((n+1)/(r+1)), yB);
                 } else {
-                    const n = (i-1) / 2;
-                    oCtx.moveTo((rT.L + (rT.R-rT.L)*(n/row))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
-                    oCtx.lineTo((rT.L + (rT.R-rT.L)*((n+1)/row))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
-                    oCtx.lineTo((rB.L + (rB.R-rB.L)*((n+1)/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
+                    const n = (i-1)/2;
+                    oCtx.moveTo(xLT + (xRT-xLT)*(n/r), yT);
+                    oCtx.lineTo(xLT + (xRT-xLT)*((n+1)/r), yT);
+                    oCtx.lineTo(xLB + (xRB-xLB)*((n+1)/(r+1)), yB);
                 }
                 oCtx.closePath();
                 if (bits) {
-                    oCtx.fillStyle = bits[bIdx] ? "rgba(0, 255, 0, 0.4)" : "rgba(255, 255, 255, 0.1)";
+                    oCtx.fillStyle = bits[idx] ? "rgba(0,255,0,0.3)" : "rgba(255,255,255,0.05)";
                     oCtx.fill();
                 }
-                oCtx.strokeStyle = "rgba(0, 255, 0, 0.8)";
                 oCtx.stroke();
-                bIdx++;
+                idx++;
             }
         }
     }
