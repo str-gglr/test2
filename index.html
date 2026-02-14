@@ -3,15 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Scanner - Mesh v2</title>
+    <title>Sigil Omni-Scanner</title>
     <script src="opencv.js" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
         #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; max-height: 500px; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.5; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.4; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }
-        #result { font-size: 2.5rem; font-weight: bold; color: #444; margin-top: 20px; transition: color 0.3s; }
-        .success-text { color: #0f0 !important; text-shadow: 0 0 15px #0f0; }
+        #result { font-size: 2.5rem; font-weight: bold; color: #444; margin-top: 20px; text-shadow: 0 0 5px #000; }
+        .success-ui { color: #0f0 !important; text-shadow: 0 0 15px #0f0 !important; }
     </style>
 </head>
 <body>
@@ -20,7 +20,7 @@
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
     </div>
-    <div id="result">ID: ---</div>
+    <div id="result">---</div>
 
 <script>
     const video = document.getElementById('video');
@@ -31,13 +31,13 @@
     let cvReady = false;
     let lastScanTime = 0;
     let lockUntil = 0;
+    let cachedMesh = null; // Keeps the success mesh visible for 3s
     
     const GRID_SIZE = 400;
     const hCanvas = document.createElement('canvas');
     hCanvas.width = hCanvas.height = GRID_SIZE;
     const hCtx = hCanvas.getContext('2d');
 
-    // Auto-init on load
     window.onload = () => {
         let check = setInterval(() => {
             if (typeof cv !== 'undefined' && cv.Mat) {
@@ -57,9 +57,12 @@
 
     function loop(time) {
         if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
-            // 3 FPS scan gate
-            if (time > lockUntil && time - lastScanTime > 333) {
-                oCtx.clearRect(0, 0, overlay.width, overlay.height);
+            oCtx.clearRect(0, 0, overlay.width, overlay.height);
+            
+            // If we are in the 3s cooldown, just draw the last successful mesh
+            if (time < lockUntil && cachedMesh) {
+                drawMesh(cachedMesh.corners, cachedMesh.bits);
+            } else if (time - lastScanTime > 333) { // 3 FPS
                 processFrame(time);
                 lastScanTime = time;
             }
@@ -91,32 +94,53 @@
             cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
             if (approx.rows === 3) {
-                const c = sortCorners(approx);
+                const c = getRotationIndependentCorners(approx); // Fixed for upside down
                 const decode = evaluateBits(gray, c);
                 
                 if (decode.success) {
-                    drawMesh(c, decode.bits); // Full 16-triangle reconstruction
+                    cachedMesh = { corners: c, bits: decode.bits };
                     resultDisplay.textContent = "ID: " + decode.id.toString().padStart(3, '0');
-                    resultDisplay.classList.add('success-text');
-                    lockUntil = currentTime + 3000; // 3-second lock
-                    setTimeout(() => { 
-                        resultDisplay.classList.remove('success-text');
-                        resultDisplay.textContent = "ID: ---";
-                    }, 3000);
-                    navigator.vibrate(100);
+                    resultDisplay.classList.add('success-ui');
+                    lockUntil = currentTime + 3000;
+                    navigator.vibrate(50);
+                } else {
+                    drawEmptyMesh(c); // Show the wireframe even if bit-read fails
                 }
             }
             approx.delete(); hull.delete();
+        } else {
+            resultDisplay.textContent = "---";
+            resultDisplay.classList.remove('success-ui');
         }
         src.delete(); gray.delete(); binary.delete(); contours.delete(); hierarchy.delete();
     }
 
-    function sortCorners(approx) {
+    function getRotationIndependentCorners(approx) {
         let pts = [];
         for (let i = 0; i < 3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
-        pts.sort((a, b) => a.y - b.y);
-        const apex = pts[0];
-        const base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+        
+        // Find center of mass
+        const cx = (pts[0].x + pts[1].x + pts[2].x) / 3;
+        const cy = (pts[0].y + pts[1].y + pts[2].y) / 3;
+
+        // The "Apex" is the point whose opposite side (midpoint of other two) 
+        // is furthest from it. This works at any rotation.
+        let bestApexIdx = 0;
+        let maxDist = 0;
+        for (let i = 0; i < 3; i++) {
+            const p1 = pts[(i+1)%3], p2 = pts[(i+2)%3];
+            const midX = (p1.x + p2.x) / 2, midY = (p1.y + p2.y) / 2;
+            const dist = Math.hypot(pts[i].x - midX, pts[i].y - midY);
+            if (dist > maxDist) { maxDist = dist; bestApexIdx = i; }
+        }
+
+        const apex = pts[bestApexIdx];
+        const base = [pts[(bestApexIdx+1)%3], pts[(bestApexIdx+2)%3]];
+        
+        // Sort base points by clockwise order relative to apex
+        const angle = (p) => Math.atan2(p.y - cy, p.x - cx);
+        base.sort((a, b) => angle(a) - angle(b));
+
         return { a: apex, bl: base[0], br: base[1] };
     }
 
@@ -138,7 +162,7 @@
             }
         }
 
-        if (bits[0] === 1 && bits[9] === 1) { // Anchor check
+        if (bits[0] === 1 && bits[9] === 1) {
             const D = [bits[1], bits[3], bits[4], bits[5], bits[7], bits[8], bits[11], bits[12], bits[13]];
             const S_R = [bits[2], bits[6], bits[10], bits[14]];
             const S_C = [D[0]^D[1]^D[3]^D[4]^D[6]^D[8], D[2]^D[3]^D[4]^D[5]^D[7]^D[8], D[0]^D[2]^D[3]^D[6]^D[7], D[1]^D[4]^D[5]^D[7]^D[8]];
@@ -153,33 +177,36 @@
         return mat.ucharPtr(Math.floor(p.y), Math.floor(p.x))[0];
     }
 
+    function drawEmptyMesh(c) { drawMesh(c, null); }
+
     function drawMesh(c, bits) {
         const s = overlay.width / GRID_SIZE;
-        let bIdx = 0;
         oCtx.lineWidth = 1.5;
+        let bIdx = 0;
 
         for (let row = 0; row < 4; row++) {
             for (let i = 0; i < (row * 2 + 1); i++) {
-                // Vertex interpolation for sub-triangles
                 const tYTop = row / 4, tYBot = (row + 1) / 4;
                 const getXRange = (t) => ({ L: c.a.x + (c.bl.x - c.a.x)*t, R: c.a.x + (c.br.x - c.a.x)*t });
-                const rowT = getXRange(tYTop), rowB = getXRange(tYBot);
+                const rT = getXRange(tYTop), rB = getXRange(tYBot);
 
                 oCtx.beginPath();
-                if (i % 2 === 0) { // Point-up triangles
+                if (i % 2 === 0) {
                     const n = i / 2;
-                    oCtx.moveTo((rowT.L + (rowT.R-rowT.L)*(n/row || 0))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
-                    oCtx.lineTo((rowB.L + (rowB.R-rowB.L)*(n/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
-                    oCtx.lineTo((rowB.L + (rowB.R-rowB.L)*((n+1)/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
-                } else { // Point-down triangles
+                    oCtx.moveTo((rT.L + (rT.R-rT.L)*(n/row || 0))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
+                    oCtx.lineTo((rB.L + (rB.R-rB.L)*(n/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
+                    oCtx.lineTo((rB.L + (rB.R-rB.L)*((n+1)/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
+                } else {
                     const n = (i-1) / 2;
-                    oCtx.moveTo((rowT.L + (rowT.R-rowT.L)*(n/row))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
-                    oCtx.lineTo((rowT.L + (rowT.R-rowT.L)*((n+1)/row))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
-                    oCtx.lineTo((rowB.L + (rowB.R-rowB.L)*((n+1)/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
+                    oCtx.moveTo((rT.L + (rT.R-rT.L)*(n/row))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
+                    oCtx.lineTo((rT.L + (rT.R-rT.L)*((n+1)/row))*s, (c.a.y + (c.bl.y-c.a.y)*tYTop)*s);
+                    oCtx.lineTo((rB.L + (rB.R-rB.L)*((n+1)/(row+1)))*s, (c.a.y + (c.bl.y-c.a.y)*tYBot)*s);
                 }
                 oCtx.closePath();
-                oCtx.fillStyle = bits[bIdx] ? "rgba(0, 255, 0, 0.4)" : "rgba(255, 255, 255, 0.1)";
-                oCtx.fill();
+                if (bits) {
+                    oCtx.fillStyle = bits[bIdx] ? "rgba(0, 255, 0, 0.4)" : "rgba(255, 255, 255, 0.1)";
+                    oCtx.fill();
+                }
                 oCtx.strokeStyle = "rgba(0, 255, 0, 0.8)";
                 oCtx.stroke();
                 bIdx++;
