@@ -1,131 +1,182 @@
+// ============================================================
+//  SIGIL SCANNER — script.js
+//  Decodes a 16-cell equilateral-triangle sigil from live video.
+// ============================================================
 
-let streaming = false;
-let videoInput = document.getElementById('videoInput');
-let canvasOutput = document.getElementById('canvasOutput');
+// ===== GLOBALS =====
+let streaming = true;
+let videoInput, canvasOutput;
 let stream = null;
 let cap = null;
-let src = null;
-let dst = null;
-let gray = null;
+let src = null, dst = null, gray = null;
 
-// Constants for Sigil Processing
-const SIGIL_ROWS = 4;
-const TOTAL_SUB_TRIS = 16;
-// Standard Equilateral Triangle vertices (Normalized to 1.0 height)
+// ===== WARP TARGET: canonical equilateral triangle =====
 const WARP_SIZE = 200;
-const WARP_H = Math.floor(WARP_SIZE * Math.sqrt(3) / 2);
-const WARP_XC = WARP_SIZE / 2;
+const WARP_H = Math.floor(WARP_SIZE * Math.sqrt(3) / 2); // ~173
+const WARP_XC = WARP_SIZE / 2;                             // 100
 const TRI_PTS = [
-    { x: WARP_XC, y: 0 },            // Top
-    { x: 0, y: WARP_H },             // BL
-    { x: WARP_SIZE, y: WARP_H }      // BR
+    { x: WARP_XC, y: 0 },  // Top
+    { x: 0, y: WARP_H },  // Bottom-Left
+    { x: WARP_SIZE, y: WARP_H }   // Bottom-Right
 ];
 
-// Precompute centroids for 16 sub-triangles in the standard pose
-let centroids = [];
+// ===== PRE-COMPUTED DATA =====
+let centroids = [];   // 16 centroid positions in canonical warp space
+let rotationMaps = {};   // 0 → identity,  1 → 120°,  2 → 240°
 
+// ===== BIT LAYOUT (canonical, after rotation alignment) =====
+//  Index  0 = Anchor A1  (always BLACK)
+//  Index  9 = Anchor A2  (always BLACK)
+//  Index 15 = Sync   S   (always WHITE)
+//  Indices 1–8, 10        = Data  D1…D9
+//  Indices 11–14          = Parity P1…P4
+const ANCHOR_INDICES = [0, 9];
+const SYNC_INDEX = 15;
+const DATA_INDICES = [1, 2, 3, 4, 5, 6, 7, 8, 10];   // D1…D9
+const PARITY_INDICES = [11, 12, 13, 14];                  // P1…P4
+
+// Hamming-style parity subsets (indices into DATA_INDICES array)
+//  P1 = D1⊕D2⊕D4⊕D5⊕D7⊕D9
+//  P2 = D1⊕D3⊕D4⊕D6⊕D7
+//  P3 = D2⊕D3⊕D4⊕D8⊕D9
+//  P4 = D5⊕D6⊕D7⊕D8⊕D9
+const PARITY_SUBSETS = [
+    [0, 1, 3, 4, 6, 8],   // P1
+    [0, 2, 3, 5, 6],      // P2
+    [1, 2, 3, 7, 8],      // P3
+    [4, 5, 6, 7, 8]       // P4
+];
+
+// ===== MULTI-FRAME CONFIRMATION STATE =====
+const CONFIRM_NEEDED = 3;     // consecutive identical reads required
+let lastSeenId = -1;
+let confirmCount = 0;
+let lockedId = -1;
+let lockTimer = null;
+
+// Sampling radius around each centroid (pixels in warp space)
+const SAMPLE_RADIUS = 5;
+
+// ============================================================
+//  CENTROID GENERATION
+//  Rows 0–3 → 1, 3, 5, 7 sub-triangles  (total 16).
+//  Even k → upward ▲,  odd k → inverted ▽.
+// ============================================================
 function generateCentroids() {
-    let index = 0;
+    centroids = [];
     const dy = WARP_H / 4;
+    let idx = 0;
 
     for (let r = 0; r < 4; r++) {
-        let y_top = r * dy;
-        let y_bot = (r + 1) * dy;
-
+        const yTop = r * dy;
         for (let k = 0; k <= 2 * r; k++) {
-            let cx, cy;
-            let isUp = (k % 2 === 0);
-
-            if (isUp) {
-                cy = y_top + dy * (2 / 3);
-            } else {
-                cy = y_top + dy * (1 / 3);
-            }
-
-            let w_tri = WARP_SIZE / 4;
-            let offset_from_center = (k - r) * (w_tri / 2);
-            cx = WARP_XC + offset_from_center;
-
-            centroids.push({ x: cx, y: cy, index: index });
-            index++;
+            const isUp = (k % 2 === 0);
+            const cy = isUp ? yTop + dy * (2 / 3) : yTop + dy * (1 / 3);
+            const wTri = WARP_SIZE / 4;
+            const cx = WARP_XC + (k - r) * (wTri / 2);
+            centroids.push({ x: cx, y: cy, index: idx });
+            idx++;
         }
     }
 }
 
-// Global bit map rotation cache
-let rotationMaps = {}; // {0: [0..15], 1: [rotated], 2: [rotated]}  0=0deg, 1=120, 2=240
-
+// ============================================================
+//  ROTATION MAP GENERATION
+//  Rotates each centroid 120° / 240° around the triangle's
+//  geometric centre, then finds the nearest canonical centroid.
+// ============================================================
 function generateRotationMaps() {
-    // 0 deg
     rotationMaps[0] = Array.from({ length: 16 }, (_, i) => i);
 
-    // 120 deg (Clockwise)
-    let cx = WARP_XC;
-    let cy = WARP_H * (2 / 3);
+    const cx = WARP_XC;
+    const cy = WARP_H * (2 / 3);   // centroid of equilateral triangle
 
-    function getMap(angleRad) {
-        let map = new Array(16);
+    function buildMap(angleRad) {
+        const map = new Array(16);
         for (let i = 0; i < 16; i++) {
-            let p = centroids[i];
-            let dx = p.x - cx;
-            let dy = p.y - cy;
-            let rx = dx * Math.cos(angleRad) - dy * Math.sin(angleRad);
-            let ry = dx * Math.sin(angleRad) + dy * Math.cos(angleRad);
-            let finalX = rx + cx;
-            let finalY = ry + cy;
+            const p = centroids[i];
+            const dx = p.x - cx;
+            const dy = p.y - cy;
+            const rx = dx * Math.cos(angleRad) - dy * Math.sin(angleRad) + cx;
+            const ry = dx * Math.sin(angleRad) + dy * Math.cos(angleRad) + cy;
 
-            let bestIdx = -1;
-            let minDist = Infinity;
+            let best = -1, bestD = Infinity;
             for (let j = 0; j < 16; j++) {
-                let p2 = centroids[j];
-                let d = (p2.x - finalX) ** 2 + (p2.y - finalY) ** 2;
-                if (d < minDist) {
-                    minDist = d;
-                    bestIdx = j;
-                }
+                const d = (centroids[j].x - rx) ** 2 + (centroids[j].y - ry) ** 2;
+                if (d < bestD) { bestD = d; best = j; }
             }
-            map[i] = bestIdx;
+            map[i] = best;
         }
         return map;
     }
 
-    rotationMaps[1] = getMap(2 * Math.PI / 3);  // 120 deg
-    rotationMaps[2] = getMap(4 * Math.PI / 3);  // 240 deg
+    rotationMaps[1] = buildMap(2 * Math.PI / 3);   // 120°
+    rotationMaps[2] = buildMap(4 * Math.PI / 3);    // 240°
 }
 
+// ============================================================
+//  SAMPLE REGION
+//  Average luminance in a NxN patch around a centroid.
+//  Much more robust than a single-pixel read on noisy images.
+// ============================================================
+function sampleRegion(mat, px, py, radius) {
+    let sum = 0, n = 0;
+    const r = radius || SAMPLE_RADIUS;
+    const xc = Math.round(px);
+    const yc = Math.round(py);
 
+    for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+            const x = xc + dx;
+            const y = yc + dy;
+            if (x >= 0 && x < mat.cols && y >= 0 && y < mat.rows) {
+                sum += mat.ucharAt(y, x);
+                n++;
+            }
+        }
+    }
+    return n > 0 ? sum / n : 128;
+}
+
+// ============================================================
+//  OPENCV INIT
+// ============================================================
 function onOpenCvReady() {
-    console.log("OpenCV Ready - Starting Camera");
-    document.getElementById('status-text').innerHTML = "Camera Starting...";
-    // Ensure functions are called safely
+    console.log('OpenCV Ready');
+    document.getElementById('status-text').textContent = 'Camera Starting…';
     try {
-        startCamera();
         generateCentroids();
         generateRotationMaps();
+        startCamera();
     } catch (e) {
-        console.error("Initialization Error:", e);
-        document.getElementById('status-text').innerHTML = "Init Error";
+        console.error('Init error:', e);
+        document.getElementById('status-text').textContent = 'Init Error';
     }
 }
 
+// ============================================================
+//  CAMERA
+// ============================================================
 function startCamera() {
-    console.log('startCamera called');
+    console.log('startCamera');
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        console.error('getUserMedia is not supported — are you on HTTPS or localhost?');
-        document.getElementById('status-text').innerHTML = "Camera Not Supported";
+        console.error('getUserMedia unavailable (need HTTPS or localhost)');
+        document.getElementById('status-text').textContent = 'Camera Not Supported';
         return;
     }
 
-    // Set up the metadata handler BEFORE requesting the stream
+    videoInput = document.getElementById('videoInput');
+    canvasOutput = document.getElementById('canvasOutput');
+
+    // Register handler BEFORE the stream arrives
     videoInput.onloadedmetadata = function () {
-        console.log('Video metadata loaded:', videoInput.videoWidth, 'x', videoInput.videoHeight);
-        document.getElementById('status-text').innerHTML = "System Ready";
+        console.log('Video ready:', videoInput.videoWidth, '×', videoInput.videoHeight);
+        document.getElementById('status-text').textContent = 'Scanning…';
         document.getElementById('status-dot').className = 'status-dot active';
 
         videoInput.width = videoInput.videoWidth;
         videoInput.height = videoInput.videoHeight;
-
         canvasOutput.width = videoInput.videoWidth;
         canvasOutput.height = videoInput.videoHeight;
 
@@ -138,11 +189,7 @@ function startCamera() {
     };
 
     navigator.mediaDevices.getUserMedia({
-        video: {
-            facingMode: 'environment',
-            width: { ideal: 1280 },
-            height: { ideal: 720 }
-        },
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false
     })
         .then(function (s) {
@@ -153,10 +200,14 @@ function startCamera() {
         })
         .catch(function (err) {
             console.error('Camera error:', err);
-            document.getElementById('status-text').innerHTML = "Camera Error: " + err.message;
+            document.getElementById('status-text').textContent = 'Camera Error: ' + err.message;
+            document.getElementById('status-dot').className = 'status-dot error';
         });
 }
 
+// ============================================================
+//  MAIN LOOP
+// ============================================================
 function processVideo() {
     try {
         if (!streaming) {
@@ -166,37 +217,40 @@ function processVideo() {
             return;
         }
 
-        let begin = Date.now();
-
         cap.read(src);
         src.copyTo(dst);
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-        // Find Contours
+        // --- Binarise for contour detection ---
+        let blurred = new cv.Mat();
+        let binary = new cv.Mat();
+        cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+        cv.adaptiveThreshold(blurred, binary, 255,
+            cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 21, 5);
+        blurred.delete();
+
         let contours = new cv.MatVector();
         let hierarchy = new cv.Mat();
-        // Use gray for contours? Better to use binary.
-        let binary = new cv.Mat();
-        cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 21, 5);
-        cv.findContours(binary, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
+        cv.findContours(binary, contours, hierarchy,
+            cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
         binary.delete();
 
-        let foundSigil = false;
+        // --- Find the LARGEST valid triangle ---
+        let bestResult = null;
+        let bestArea = 0;
+        let bestContourIdx = -1;
 
-        for (let i = 0; i < contours.size(); ++i) {
-            let cnt = contours.get(i);
-            let area = cv.contourArea(cnt);
+        for (let i = 0; i < contours.size(); i++) {
+            const cnt = contours.get(i);
+            const area = cv.contourArea(cnt);
+            if (area < 3000 || area <= bestArea) continue;
 
-            if (area < 2000) continue;
-
-            let peri = cv.arcLength(cnt, true);
-            let approx = new cv.Mat();
+            const peri = cv.arcLength(cnt, true);
+            const approx = new cv.Mat();
             cv.approxPolyDP(cnt, approx, 0.04 * peri, true);
 
             if (approx.rows === 3 && cv.isContourConvex(approx)) {
-                let color = new cv.Scalar(0, 255, 0, 255);
-
-                let pts = [];
+                const pts = [];
                 for (let j = 0; j < 3; j++) {
                     pts.push({
                         x: approx.data32S[j * 2],
@@ -204,125 +258,240 @@ function processVideo() {
                     });
                 }
 
-                let result = decodeSigil(pts, gray);
-
+                const result = decodeSigil(pts);
                 if (result) {
-                    foundSigil = true;
-                    cv.drawContours(dst, contours, i, color, 3, cv.LINE_8, hierarchy, 0);
-                    updateUI(result);
+                    bestResult = result;
+                    bestArea = area;
+                    bestContourIdx = i;
                 }
             }
             approx.delete();
         }
 
-        cv.imshow('canvasOutput', dst);
+        // --- Draw result & update UI ---
+        if (bestResult && bestContourIdx >= 0) {
+            const green = new cv.Scalar(0, 255, 157, 255);
+            cv.drawContours(dst, contours, bestContourIdx, green, 3,
+                cv.LINE_8, hierarchy, 0);
+            handleDetection(bestResult);
+        } else if (lockedId < 0) {
+            document.getElementById('status-text').textContent = 'Scanning…';
+        }
 
+        cv.imshow('canvasOutput', dst);
         contours.delete();
         hierarchy.delete();
-
-        let delay = 1000 / 30 - (Date.now() - begin);
-        requestAnimationFrame(processVideo);
-
     } catch (err) {
-        console.error(err);
+        console.error('processVideo:', err);
     }
+
+    requestAnimationFrame(processVideo);
 }
 
-function decodeSigil(trianglePts, imageMat) {
-    trianglePts.sort((a, b) => a.y - b.y);
-    if (trianglePts[1].x > trianglePts[2].x) {
-        let tmp = trianglePts[1];
-        trianglePts[1] = trianglePts[2];
-        trianglePts[2] = tmp;
+// ============================================================
+//  DECODE SIGIL
+//  1. Affine-warp detected triangle → canonical equilateral
+//  2. Sample 16 centroids (area-averaged)
+//  3. Try all 3 rotations; for each:
+//      a. Use 2 black anchors  → darkRef  (floor of darkness)
+//      b. Use 1 white sync     → lightRef (ceiling of brightness)
+//      c. Adaptive threshold   = darkRef + 0.5 × (lightRef − darkRef)
+//      d. Classify 16 bits
+//      e. Verify parity
+//  4. Return best-contrast valid decode, or null.
+// ============================================================
+function decodeSigil(triPts) {
+    // 1. Sort vertices: top-most first, then left-before-right for bottom pair
+    triPts.sort((a, b) => a.y - b.y);
+    if (triPts[1].x > triPts[2].x) {
+        [triPts[1], triPts[2]] = [triPts[2], triPts[1]];
     }
 
-    let srcTri = cv.matFromArray(3, 1, cv.CV_32FC2, [
-        trianglePts[0].x, trianglePts[0].y,
-        trianglePts[1].x, trianglePts[1].y,
-        trianglePts[2].x, trianglePts[2].y
+    // 2. Affine warp
+    const srcTri = cv.matFromArray(3, 1, cv.CV_32FC2, [
+        triPts[0].x, triPts[0].y,
+        triPts[1].x, triPts[1].y,
+        triPts[2].x, triPts[2].y
     ]);
-
-    let dstTri = cv.matFromArray(3, 1, cv.CV_32FC2, [
+    const dstTri = cv.matFromArray(3, 1, cv.CV_32FC2, [
         TRI_PTS[0].x, TRI_PTS[0].y,
         TRI_PTS[1].x, TRI_PTS[1].y,
         TRI_PTS[2].x, TRI_PTS[2].y
     ]);
+    const M = cv.getAffineTransform(srcTri, dstTri);
+    const warped = new cv.Mat();
+    const dsize = new cv.Size(WARP_SIZE + 1, WARP_H + 1);
+    cv.warpAffine(gray, warped, M, dsize,
+        cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(128));
 
-    let M = cv.getAffineTransform(srcTri, dstTri);
-    let warped = new cv.Mat();
-    let dsize = new cv.Size(WARP_SIZE, WARP_SIZE + 20);
-    cv.warpAffine(gray, warped, M, dsize, cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
-
-    let samples = [];
-    let bits = [];
-
+    // 3. Sample all 16 centroids with area averaging
+    const lum = [];
     for (let i = 0; i < 16; i++) {
-        let p = centroids[i];
-        if (p.x < 0 || p.x >= warped.cols || p.y < 0 || p.y >= warped.rows) {
-            samples.push(0);
-        } else {
-            let pixel = warped.ucharAt(Math.floor(p.y), Math.floor(p.x));
-            samples.push(pixel);
-        }
+        lum.push(sampleRegion(warped, centroids[i].x, centroids[i].y, SAMPLE_RADIUS));
     }
 
-    let sorted = [...samples].sort((a, b) => a - b);
-    let median = sorted[8];
-
-    for (let i = 0; i < 16; i++) {
-        let val = (samples[i] < median) ? 1 : 0;
-        bits.push(val);
-    }
-
-    let validRotation = -1;
-    let finalBits = null;
+    // 4. Try all 3 rotations
+    let bestResult = null;
+    let bestContrast = 0;
 
     for (let rot = 0; rot < 3; rot++) {
-        let map = rotationMaps[rot];
-        let c0 = bits[map[0]];
-        let c9 = bits[map[9]];
-        let c15 = bits[map[15]];
+        const map = rotationMaps[rot];
 
-        if (c0 + c9 + c15 === 2) {
-            validRotation = rot;
-            finalBits = [];
-            for (let k = 0; k < 16; k++) {
-                finalBits.push(bits[map[k]]);
-            }
-            break;
+        // Map raw luminance into canonical frame
+        const canon = new Array(16);
+        for (let i = 0; i < 16; i++) canon[i] = lum[map[i]];
+
+        // Anchor / Sync luminance
+        const a1Lum = canon[ANCHOR_INDICES[0]];   // index 0
+        const a2Lum = canon[ANCHOR_INDICES[1]];   // index 9
+        const syncLum = canon[SYNC_INDEX];           // index 15
+
+        // Anchors must be darker than sync
+        if (a1Lum >= syncLum || a2Lum >= syncLum) continue;
+
+        const darkRef = (a1Lum + a2Lum) / 2;       // average black
+        const lightRef = syncLum;                     // white reference
+        const contrast = lightRef - darkRef;
+
+        // Reject low-contrast (noisy / bad frame)
+        if (contrast < 30) continue;
+
+        // Adaptive threshold: midpoint of calibrated scale
+        const thresh = darkRef + contrast * 0.5;
+
+        // Classify all 16 bits: darker-than-threshold → 1 (black)
+        const bits = new Array(16);
+        for (let i = 0; i < 16; i++) {
+            bits[i] = (canon[i] < thresh) ? 1 : 0;
+        }
+
+        // Verify structural constraints
+        if (bits[ANCHOR_INDICES[0]] !== 1) continue;   // anchor must be black
+        if (bits[ANCHOR_INDICES[1]] !== 1) continue;
+        if (bits[SYNC_INDEX] !== 0) continue;   // sync must be white
+
+        // Extract data & parity
+        const dataBits = DATA_INDICES.map(i => bits[i]);
+        const parityBits = PARITY_INDICES.map(i => bits[i]);
+
+        // Verify parity
+        let parityOk = true;
+        for (let p = 0; p < 4; p++) {
+            let expected = 0;
+            for (const di of PARITY_SUBSETS[p]) expected ^= dataBits[di];
+            if (expected !== parityBits[p]) { parityOk = false; break; }
+        }
+        if (!parityOk) continue;
+
+        // Compute ID from 9 data bits (MSB-first → 0…511)
+        let id = 0;
+        for (let i = 0; i < 9; i++) id = (id << 1) | dataBits[i];
+
+        // Keep the decode with the highest contrast (best quality)
+        if (contrast > bestContrast) {
+            bestContrast = contrast;
+            bestResult = {
+                id,
+                bits,
+                dataBits,
+                parityBits,
+                rotation: rot * 120,
+                contrast: Math.round(contrast),
+                darkRef: Math.round(darkRef),
+                lightRef: Math.round(lightRef)
+            };
         }
     }
 
-    srcTri.delete(); dstTri.delete(); M.delete(); warped.delete();
+    // Cleanup OpenCV mats
+    srcTri.delete();
+    dstTri.delete();
+    M.delete();
+    warped.delete();
 
-    if (validRotation !== -1) {
-        return {
-            bits: finalBits,
-            raw: bits,
-            rotation: validRotation
-        };
-    }
-
-    return null;
+    return bestResult;
 }
 
-function updateUI(result) {
-    let bits = result.bits;
-    let grid = document.getElementById('bit-grid');
+// ============================================================
+//  MULTI-FRAME CONFIRMATION
+//  Only "lock" an ID after CONFIRM_NEEDED consecutive identical reads.
+//  Auto-unlocks after 5 s so scanning resumes.
+// ============================================================
+function handleDetection(result) {
+    if (result.id === lastSeenId) {
+        confirmCount++;
+    } else {
+        lastSeenId = result.id;
+        confirmCount = 1;
+    }
+
+    if (confirmCount >= CONFIRM_NEEDED) {
+        lockedId = result.id;
+        updateUI(result, true);
+
+        // Auto-unlock after 5 s
+        if (lockTimer) clearTimeout(lockTimer);
+        lockTimer = setTimeout(() => {
+            lockedId = -1;
+            lastSeenId = -1;
+            confirmCount = 0;
+            document.getElementById('debug-panel').style.display = 'none';
+            document.getElementById('id-display').className = 'id-display';
+            document.getElementById('id-value').textContent = '---';
+            document.getElementById('status-text').textContent = 'Scanning…';
+            document.getElementById('status-dot').className = 'status-dot active';
+        }, 5000);
+    } else {
+        updateUI(result, false);
+    }
+}
+
+// ============================================================
+//  UI UPDATE
+// ============================================================
+function updateUI(result, confirmed) {
+    const bits = result.bits;
+
+    // --- Bit grid ---
+    const grid = document.getElementById('bit-grid');
     grid.innerHTML = '';
-
     for (let i = 0; i < 16; i++) {
-        let div = document.createElement('div');
-        div.className = 'bit ' + (bits[i] ? 'one' : 'zero');
-        div.innerText = i;
-        grid.appendChild(div);
+        const cell = document.createElement('div');
+        // Determine role for colour-coding
+        let role = 'data';
+        if (ANCHOR_INDICES.includes(i)) role = 'anchor';
+        else if (i === SYNC_INDEX) role = 'sync';
+        else if (PARITY_INDICES.includes(i)) role = 'parity';
+
+        cell.className = 'bit '
+            + (bits[i] ? 'one' : 'zero') + ' '
+            + role;
+        cell.textContent = bits[i];
+        grid.appendChild(cell);
     }
 
-    let dbg = document.getElementById('debug-panel');
-    dbg.style.display = 'block';
+    // --- ID display ---
+    const idStr = String(result.id).padStart(3, '0');
+    document.getElementById('id-value').textContent = idStr;
 
-    document.getElementById('status-text').innerHTML = "SCAN DETECTED";
-    document.getElementById('status-dot').className = "status-dot active";
+    const idDisplay = document.getElementById('id-display');
+    idDisplay.className = confirmed ? 'id-display confirmed' : 'id-display pending';
+
+    // --- Meta info ---
+    document.getElementById('meta-info').innerHTML =
+        'ROT ' + result.rotation + '°  · CONTRAST ' + result.contrast +
+        '  · DARK ' + result.darkRef + ' / LIGHT ' + result.lightRef;
+
+    document.getElementById('parity-status').textContent =
+        'PARITY: PASS ✓';
+    document.getElementById('parity-status').className = 'parity-pass';
+
+    // --- Status bar ---
+    document.getElementById('status-dot').className =
+        confirmed ? 'status-dot locked' : 'status-dot active';
+    document.getElementById('status-text').textContent =
+        confirmed ? 'ID LOCKED' : 'CONFIRMING ' + confirmCount + '/' + CONFIRM_NEEDED + '…';
+
+    // --- Show panel ---
+    document.getElementById('debug-panel').style.display = 'block';
 }
-
-streaming = true;

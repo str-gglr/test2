@@ -5,79 +5,76 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Sigil Scanner</title>
+    <meta name="description" content="Real-time triangular sigil code scanner using computer vision">
     <link rel="stylesheet" href="style.css">
     <link rel="manifest" href="manifest.json">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600&display=swap"
+        rel="stylesheet">
 </head>
 
 <body>
 
     <div id="container">
-        <!-- Hidden video element for OpenCV source -->
         <video id="videoInput" playsinline muted></video>
-
-        <!-- Canvas for processing and display -->
         <canvas id="canvasOutput"></canvas>
 
         <!-- UI Overlay -->
         <div id="ui-layer">
+
+            <!-- Header -->
             <div class="header">
                 <h1>SIGIL SCANNER</h1>
                 <div class="status">
                     <div id="status-dot" class="status-dot"></div>
-                    <span id="status-text">Initializing...</span>
+                    <span id="status-text">Initializing…</span>
                 </div>
             </div>
 
             <div class="scan-line"></div>
 
-            <div id="debug-panel">
-                <div>RAW BITSTREAM</div>
-                <div id="bit-grid" class="grid-display">
-                    <!-- Javascript will populate this -->
+            <!-- Result Panel -->
+            <div id="result-area">
+
+                <!-- Large ID readout -->
+                <div id="id-display" class="id-display">
+                    <div class="id-label">DECODED ID</div>
+                    <div id="id-value" class="id-value">---</div>
                 </div>
-                <div style="margin-top:8px; font-size: 0.7em; opacity: 0.6;">
-                    PARITY: UNKNOWN SCHEMA<br>
-                    ROTATION: LOCKED
+
+                <!-- Debug / detail panel -->
+                <div id="debug-panel">
+                    <div class="panel-row">
+                        <span class="panel-label">BITSTREAM</span>
+                        <span id="parity-status" class="parity-unknown">PARITY: —</span>
+                    </div>
+                    <div id="bit-grid" class="grid-display"></div>
+                    <div id="meta-info" class="meta-info">—</div>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- Main Logic -->
+    <!-- Scanner logic (defines onOpenCvReady) -->
     <script src="script.js"></script>
 
-    <!-- Load OpenCV.js with fallback -->
+    <!-- OpenCV bootstrap -->
     <script>
         function checkOpenCv() {
-            // Check if OpenCV is ready
             if (typeof cv !== 'undefined' && cv.getBuildInformation) {
                 console.log('OpenCV loaded and ready.');
-                // Call the init function defined in script.js
-                if (typeof onOpenCvReady === 'function') {
-                    onOpenCvReady();
-                } else {
-                    console.error("onOpenCvReady not found in script.js");
-                }
+                if (typeof onOpenCvReady === 'function') onOpenCvReady();
+            } else if (typeof cv !== 'undefined' && !cv.onRuntimeInitialized) {
+                console.log('OpenCV defined, hooking onRuntimeInitialized…');
+                cv.onRuntimeInitialized = () => {
+                    console.log('onRuntimeInitialized fired.');
+                    if (typeof onOpenCvReady === 'function') onOpenCvReady();
+                };
             } else {
-                // Not ready, try to hook or wait
-                if (typeof cv !== 'undefined' && !cv.onRuntimeInitialized) {
-                    // Hook into runtime initialized if not already set
-                    console.log('OpenCV defined, hooking onRuntimeInitialized...');
-                    cv.onRuntimeInitialized = () => {
-                        console.log('onRuntimeInitialized fired.');
-                        if (typeof onOpenCvReady === 'function') {
-                            onOpenCvReady();
-                        }
-                    };
-                } else {
-                    // Poll again
-                    // console.log('Waiting for OpenCV...');
-                    setTimeout(checkOpenCv, 100);
-                }
+                setTimeout(checkOpenCv, 100);
             }
         }
-
-        // Start checking
         checkOpenCv();
     </script>
     <script async src="opencv.js" type="text/javascript"></script>
