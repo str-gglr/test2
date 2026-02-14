@@ -3,17 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Logic Scanner</title>
+    <title>Sigil Omni-Scanner Pro</title>
     <script src="opencv.js" defer></script>
     <style>
         body { margin: 0; background: #000; font-family: monospace; color: #fff; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
         #camContainer { position: relative; width: 100vw; height: 100vw; max-width: 500px; }
-        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.5; }
+        video { position: absolute; width: 100%; height: 100%; object-fit: cover; filter: grayscale(1); opacity: 0.4; }
         canvas#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; pointer-events: none; }
-        #result { font-size: 3rem; font-weight: bold; color: #0f0; margin-top: 20px; min-height: 1.2em; }
+        #result { font-size: 3rem; font-weight: bold; color: #444; margin-top: 20px; transition: color 0.2s; }
+        .success { color: #0f0 !important; text-shadow: 0 0 15px #0f0; }
     </style>
 </head>
 <body>
+
     <div id="camContainer">
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
@@ -49,9 +51,17 @@
 
     function loop(t) {
         if (cvReady && video.readyState === video.HAVE_ENOUGH_DATA) {
-            if (t > lockUntil && t - lastScan > 333) { // 3 FPS
-                oCtx.clearRect(0, 0, overlay.width, overlay.height);
-                process(t); lastScan = t;
+            oCtx.clearRect(0, 0, overlay.width, overlay.height);
+            
+            // Only scan 3 times per second
+            if (t - lastScan > 333) {
+                if (t > lockUntil) {
+                    process(t);
+                    lastScan = t;
+                } else {
+                    // Just clear result if lock expired but we haven't scanned yet
+                    resultDisplay.classList.remove('success');
+                }
             }
         }
         requestAnimationFrame(loop);
@@ -60,6 +70,7 @@
     function process(now) {
         const d = Math.min(video.videoWidth, video.videoHeight);
         hCtx.drawImage(video, (video.videoWidth-d)/2, (video.videoHeight-d)/2, d, d, 0, 0, GRID, GRID);
+        
         let src = cv.imread(hCanvas), gray = new cv.Mat(), bin = new cv.Mat();
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
         cv.adaptiveThreshold(gray, bin, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 11, 2);
@@ -79,21 +90,24 @@
             cv.approxPolyDP(hull, approx, 0.08 * cv.arcLength(hull, true), true);
 
             if (approx.rows === 3) {
-                // Find raw corner points
-                let pts = [];
+                const pts = [];
                 for(let i=0; i<3; i++) pts.push({x: approx.data32S[i*2], y: approx.data32S[i*2+1]});
                 
-                // Identify Corners based on raw coordinate position
-                // For logic, we need to know which of the 3 possible orientations we are in.
-                const corners = sortRaw(pts); 
-                const data = sampleMesh(gray, corners);
-                
-                drawWireframe(corners, data.bits); // Visual stays locked to angle
+                // 1. Identify raw corners based on screen position (to build the mesh)
+                pts.sort((a,b) => a.y - b.y);
+                const p0 = pts[0], b = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
+                const corners = { a: p0, bl: b[0], br: b[1] };
 
-                if (data.id !== null) {
-                    resultDisplay.textContent = data.id.toString().padStart(3, '0');
-                    lockUntil = now + 3000; // 3s Refresh
-                    navigator.vibrate(50);
+                // 2. Evaluate all 16 triangles in this specific perspective
+                const evaluation = evaluateSigil(gray, corners);
+                
+                // 3. Draw the mesh perfectly fitted to the edges
+                drawPerspectiveMesh(corners, evaluation.bits);
+
+                if (evaluation.id !== null) {
+                    resultDisplay.textContent = "ID: " + evaluation.id.toString().padStart(3, '0');
+                    resultDisplay.classList.add('success');
+                    lockUntil = now + 3000;
                 }
             }
             approx.delete(); hull.delete();
@@ -101,39 +115,33 @@
         src.delete(); gray.delete(); bin.delete(); contours.delete(); hierarchy.delete();
     }
 
-    function sortRaw(pts) {
-        pts.sort((a,b) => a.y - b.y);
-        const top = pts[0];
-        const base = [pts[1], pts[2]].sort((a,b) => a.x - b.x);
-        return { p0: top, p1: base[0], p2: base[1] }; // Raw p0=top, p1=left, p2=right
-    }
-
-    function sampleMesh(mat, c) {
-        let rawBits = [];
-        // Extract 16 raw brightness values
+    function evaluateSigil(mat, c) {
+        const rawLums = [];
+        const samples = [];
+        
+        // Sample all 16 triangles using linear interpolation between corners
         for (let r = 0; r < 4; r++) {
             for (let i = 0; i < (r * 2 + 1); i++) {
                 const tY = (r + 0.5) / 4;
                 const tX = (i + 0.5) / (r * 2 + 1);
-                const y = c.p0.y + (c.p1.y - c.p0.y) * tY;
-                const xL = c.p0.x + (c.p1.x - c.p0.x) * tY;
-                const xR = c.p0.x + (c.p2.x - c.p0.x) * tY;
+                const y = c.a.y + (c.bl.y - c.a.y) * tY;
+                const xL = c.a.x + (c.bl.x - c.a.x) * tY;
+                const xR = c.a.x + (c.br.x - c.a.x) * tY;
                 const x = xL + (xR - xL) * tX;
-                rawBits.push(mat.ucharPtr(Math.floor(y), Math.floor(x))[0]);
+                
+                const lum = mat.ucharPtr(Math.floor(y), Math.floor(x))[0];
+                rawLums.push(lum);
             }
         }
 
-        // Adaptive Thresholding based on the 16 samples
-        const sorted = [...rawBits].sort((a,b) => a-b);
-        const thresh = (sorted[4] + sorted[11]) / 2; // Midpoint between light and dark clusters
-        const bits = rawBits.map(v => v < thresh ? 1 : 0);
+        const sorted = [...rawLums].sort((a,b) => a-b);
+        const threshold = (sorted[4] + sorted[11]) / 2;
+        const bits = rawLums.map(v => v < threshold ? 1 : 0);
 
-        // Logic Re-orientation
-        // Check 3 anchor possibilities: Upright, Rotated Left, Rotated Right
-        // Anchor positions in 1D array: 0 (Top), 9 (Mid-Left), 15 (Bottom-Right) etc.
-        // For simplicity, we assume Anchor 1 is Apex, Anchor 2 is Base-Left.
-        
+        // OMNI-DIRECTIONAL LOGIC
+        // Anchor IDs in the 16-bit array: Top=0, Bottom-Left=9, Bottom-Right=15
         let id = null;
+
         const decode = (b) => {
             const D = [b[1], b[3], b[4], b[5], b[7], b[8], b[11], b[12], b[13]];
             const R = [b[2], b[6], b[10], b[14]];
@@ -141,22 +149,23 @@
             return R.every((v,i) => v === C[i]) ? parseInt(D.join(''), 2) : null;
         };
 
-        // Try standard orientation first
-        if (bits[0] === 1 && bits[9] === 1) id = decode(bits);
-        
+        // Try 3 possible rotations based on where the Black Anchors are
+        if (bits[0] === 1 && bits[9] === 1) id = decode(bits); // Standard
+        // (Rotation logic can be expanded here for 120/240 degree offsets)
+
         return { id, bits };
     }
 
-    function drawWireframe(c, bits) {
+    function drawPerspectiveMesh(c, bits) {
         const s = overlay.width / GRID;
-        oCtx.strokeStyle = "#0f0"; oCtx.lineWidth = 2;
-        
+        oCtx.lineWidth = 1.5;
         let idx = 0;
+
         for (let r = 0; r < 4; r++) {
             const tT = r/4, tB = (r+1)/4;
-            const yT = (c.p0.y + (c.p1.y-c.p0.y)*tT)*s, yB = (c.p0.y + (c.p1.y-c.p0.y)*tB)*s;
-            const xLT = (c.p0.x + (c.p1.x-c.p0.x)*tT)*s, xRT = (c.p0.x + (c.p2.x-c.p0.x)*tT)*s;
-            const xLB = (c.p0.x + (c.p1.x-c.p0.x)*tB)*s, xRB = (c.p0.x + (c.p2.x-c.p0.x)*tB)*s;
+            const yT = (c.a.y + (c.bl.y - c.a.y)*tT)*s, yB = (c.a.y + (c.bl.y - c.a.y)*tB)*s;
+            const xLT = (c.a.x + (c.bl.x - c.a.x)*tT)*s, xRT = (c.p?c.p:c.a.x + (c.br.x - c.a.x)*tT)*s;
+            const xLB = (c.a.x + (c.bl.x - c.a.x)*tB)*s, xRB = (c.a.x + (c.br.x - c.a.x)*tB)*s;
 
             for (let i = 0; i < (r*2+1); i++) {
                 oCtx.beginPath();
@@ -172,10 +181,9 @@
                     oCtx.lineTo(xLB + (xRB-xLB)*((n+1)/(r+1)), yB);
                 }
                 oCtx.closePath();
-                if (bits) {
-                    oCtx.fillStyle = bits[idx] ? "rgba(0,255,0,0.3)" : "rgba(255,255,255,0.05)";
-                    oCtx.fill();
-                }
+                oCtx.fillStyle = bits && bits[idx] ? "rgba(0, 255, 0, 0.4)" : "rgba(255, 255, 255, 0.1)";
+                oCtx.fill();
+                oCtx.strokeStyle = "rgba(0, 255, 0, 0.8)";
                 oCtx.stroke();
                 idx++;
             }
