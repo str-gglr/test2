@@ -4,616 +4,66 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sigil Omni-Scanner Pro</title>
-    <script src="opencv.js" defer></script>
-    <style>
-        body {
-            margin: 0;
-            background: #000;
-            font-family: 'Courier New', monospace;
-            color: #fff;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-        }
-
-        #camContainer {
-            position: relative;
-            width: 100vw;
-            height: 100vw;
-            max-width: 500px;
-            max-height: 500px;
-            box-shadow: 0 0 20px rgba(0, 255, 0, 0.2);
-            border: 1px solid #333;
-        }
-
-        video {
-            position: absolute;
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            opacity: 1.0;
-        }
-
-        canvas#overlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 5;
-            pointer-events: none;
-        }
-
-        #result {
-            font-size: 2rem;
-            font-weight: bold;
-            color: #444;
-            margin-top: 20px;
-            min-height: 3rem;
-            text-align: center;
-            width: 90%;
-            word-break: break-all;
-        }
-
-        .success {
-            color: #0f0 !important;
-            text-shadow: 0 0 10px #0f0;
-            animation: pulse 0.5s ease-in-out;
-        }
-
-        @keyframes pulse {
-            0% {
-                transform: scale(1);
-            }
-
-            50% {
-                transform: scale(1.05);
-            }
-
-            100% {
-                transform: scale(1);
-            }
-        }
-
-        #debug {
-            position: absolute;
-            top: 10px;
-            left: 10px;
-            font-size: 0.8rem;
-            color: #aaa;
-            pointer-events: none;
-            z-index: 10;
-            white-space: pre-wrap;
-        }
-
-        .instruction {
-            position: absolute;
-            bottom: 20px;
-            font-size: 0.9rem;
-            color: #888;
-            text-align: center;
-            width: 100%;
-            pointer-events: none;
-        }
-
-        #startBtn {
-            position: absolute;
-            z-index: 1000;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            padding: 20px 40px;
-            font-size: 1.5rem;
-            background: #0f0;
-            color: #000;
-            border: none;
-            font-weight: bold;
-            cursor: pointer;
-        }
-    </style>
+    <title>Sigil Scanner</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="manifest" href="manifest.json">
 </head>
 
 <body>
 
-    <button id="startBtn" onclick="initSystem()">START SCAN</button>
-    <div id="debug">System Initializing...</div>
-    <div id="camContainer">
-        <video id="video" playsinline muted></video>
-        <canvas id="overlay"></canvas>
+    <div id="container">
+        <!-- Hidden video element for OpenCV source -->
+        <video id="videoInput" playsinline muted></video>
+
+        <!-- Canvas for processing and display -->
+        <canvas id="canvasOutput"></canvas>
+
+        <!-- UI Overlay -->
+        <div id="ui-layer">
+            <div class="header">
+                <h1>SIGIL SCANNER</h1>
+                <div class="status">
+                    <div id="status-dot" class="status-dot"></div>
+                    <span id="status-text">Initializing...</span>
+                </div>
+            </div>
+
+            <div class="scan-line"></div>
+
+            <div id="debug-panel">
+                <div>RAW BITSTREAM</div>
+                <div id="bit-grid" class="grid-display">
+                    <!-- Javascript will populate this -->
+                </div>
+                <div style="margin-top:8px; font-size: 0.7em; opacity: 0.6;">
+                    PARITY: UNKNOWN SCHEMA<br>
+                    ROTATION: LOCKED
+                </div>
+            </div>
+        </div>
     </div>
-    <div id="result">Waiting for Sigil...</div>
-    <div class="instruction">Align the triangle within the frame</div>
+
+    <!-- Load OpenCV.js -->
+    <script src="opencv.js" type="text/javascript"></script>
+
+    <!-- Main Logic -->
+    <script src="script.js"></script>
 
     <script>
-        const video = document.getElementById('video');
-        const overlay = document.getElementById('overlay');
-        const oCtx = overlay.getContext('2d');
-        const resultDisplay = document.getElementById('result');
-        const debugDisplay = document.getElementById('debug');
-        const startBtn = document.getElementById('startBtn');
-
-        let cvReady = false;
-        let cameraActive = false;
-        let lastScanTime = 0;
-        const SCAN_INTERVAL = 333; // 3 FPS
-        const LOCK_DURATION = 3000;
-
-        // State Machine
-        let lockUntil = 0;
-        let cachedMesh = null;
-        let cachedId = null;
-
-        // Internal processing
-        const PROCESS_WIDTH = 480;
-        const hCanvas = document.createElement('canvas');
-        const hCtx = hCanvas.getContext('2d');
-
-        // ---------------------------------------------------------
-        // 1. Geometric & Barycentric Tables
-        // ---------------------------------------------------------
-
-        // We define the standard "Logical" grid in Barycentric Coords (i,j,k)
-        // where i+j+k = 4. 
-        // i corresponds to V1 (Top), j to V2 (BL), k to V3 (BR).
-        // The triangles are indexed 0..15 in reading order (Row 0..3).
-
-        const LOGICAL_GRID = [];
-
-        function initGridSystem() {
-            let idx = 0;
-            for (let r = 0; r < 4; r++) { // Row 0..3
-                // Number of triangles in row r is 2*r + 1
-                for (let c = 0; c < 2 * r + 1; c++) {
-                    // Determine Vertices (Integers summing to 4)
-                    let vA, vB, vC;
-
-                    let m = Math.floor(c / 2);
-                    if (c % 2 === 0) { // Up Triangle
-                        // Top: (4-r, m, r-m) -> WRONG.
-                        // Let's verify Row 0 (r=0, c=0): Top (4,0,0). BL(3,1,0). BR(3,0,1).
-                        // i=4-r. Wait.
-                        // Tip of Row 0 is i=4. Base of Row 0 is i=3.
-                        // Correct formula for Up Tri (r, c=2m):
-                        // V1 (Top): i = 4 - r,     j = m,      k = r - m
-                        // V2 (BL):  i = 3 - r,     j = m + 1,  k = r - m
-                        // V3 (BR):  i = 3 - r,     j = m,      k = r - m + 1
-
-                        vA = { i: 4 - r, j: m, k: r - m };
-                        vB = { i: 3 - r, j: m + 1, k: r - m };
-                        vC = { i: 3 - r, j: m, k: r - m + 1 };
-                    } else { // Down Triangle
-                        // Top Edge is flat. Pointing down.
-                        // r=1, c=1 (Down). Verts should match neighbors.
-                        // Shared with Up(0) at (i=3, j=1, k=0) and (3,0,1).
-                        // Tip is down at (2,1,1).
-                        // V1 (TopLeft):  (3-r, m+1, r-m) ??
-                        // V2 (TopRight): (3-r, m, r-m+1) ??
-                        // V3 (Bottom):   (2-r, m+1, r-m+1) ?? -- i=2 (for r=1). 4-(r+1)?
-                        // Formulas:
-                        // TL: i = 4-r-1 = 3-r. j = m+1. k = r-m. (Matches BL of Up-Left)
-                        // TR: i = 3-r. j = m. k = r-m+1. (Matches BR of Up-Right)
-                        // Bot: i = 4-(r+1). j = m+1. k = r-m+1.
-
-                        vA = { i: 3 - r, j: m + 1, k: r - m };
-                        vB = { i: 3 - r, j: m, k: r - m + 1 };
-                        vC = { i: 2 - r, j: m + 1, k: r - m + 1 };
-                    }
-
-                    LOGICAL_GRID.push({
-                        id: idx++,
-                        verts: [vA, vB, vC],
-                        center: {
-                            i: (vA.i + vB.i + vC.i) / 3,
-                            j: (vA.j + vB.j + vC.j) / 3,
-                            k: (vA.k + vB.k + vC.k) / 3
-                        }
-                    });
-                }
+        // Start OpenCV
+        if (typeof cv !== 'undefined') {
+            if (cv.getBuildInformation) {
+                // Already loaded
+                onOpenCvReady();
+            } else {
+                // Wait for runtime
+                cv['onRuntimeInitialized'] = onOpenCvReady;
             }
-        }
-        initGridSystem();
-
-        // ---------------------------------------------------------
-        // 2. Main System Init
-        // ---------------------------------------------------------
-
-        function initSystem() {
-            startBtn.style.display = 'none';
-            cameraActive = true;
-            if (cvReady) startCamera();
-            else debugDisplay.textContent = "Waiting for OpenCV...";
-        }
-
-        var Module = {
-            onRuntimeInitialized: () => {
-                cvReady = true;
-                debugDisplay.textContent = "OpenCV Ready. Press Start.";
-                if (cameraActive) startCamera();
-            }
-        };
-
-        async function startCamera() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        facingMode: "environment",
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    }
-                });
-                // Critical for mobile: Play inside event handler or immediately after promise
-                video.srcObject = stream;
-                video.play(); // Explicit play
-
-                video.onloadedmetadata = () => {
-                    overlay.width = camContainer.clientWidth;
-                    overlay.height = camContainer.clientHeight;
-                    hCanvas.width = PROCESS_WIDTH;
-                    hCanvas.height = Math.round(PROCESS_WIDTH * (video.videoHeight / video.videoWidth));
-                    requestAnimationFrame(loop);
-                    debugDisplay.textContent = "Scanning...";
-                };
-            } catch (e) {
-                debugDisplay.textContent = "Camera Error: " + e.message;
-                console.error(e);
-            }
-        }
-
-        function loop(time) {
-            requestAnimationFrame(loop);
-            if (!cvReady || video.readyState !== 4) return; // 4 = HAVE_ENOUGH_DATA
-
-            // 3. State Machine Check
-            if (time < lockUntil) {
-                // State: Locked/Cooldown
-                drawLockedState();
-                return;
-            } else if (cachedMesh) {
-                // Reset after lock
-                cachedMesh = null;
-                cachedId = null;
-                resultDisplay.textContent = "Waiting for Sigil...";
-                resultDisplay.className = "";
-            }
-
-            // Throttle 3 FPS
-            if (time - lastScanTime < SCAN_INTERVAL) return;
-            lastScanTime = time;
-
-            try {
-                const success = processFrame(time);
-                if (success) {
-                    lockUntil = time + LOCK_DURATION;
-                }
-            } catch (e) {
-                console.error("Frame Error", e);
-            }
-        }
-
-        // ---------------------------------------------------------
-        // 4. Vision Pipeline
-        // ---------------------------------------------------------
-
-        function processFrame(time) {
-            hCtx.drawImage(video, 0, 0, hCanvas.width, hCanvas.height);
-
-            let src = cv.imread(hCanvas);
-            let gray = new cv.Mat();
-            let binary = new cv.Mat();
-
-            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-            // Basic thresholding or adaptive? "Adaptive Luminance Evaluation"
-            // But for finding the mesh we need edges.
-            cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 11, 2);
-
-            let contours = new cv.MatVector();
-            let hierarchy = new cv.Mat();
-            cv.findContours(binary, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-            let bestResult = null;
-            let maxArea = 0;
-
-            for (let i = 0; i < contours.size(); ++i) {
-                let cnt = contours.get(i);
-                let area = cv.contourArea(cnt);
-
-                if (area > 2000) {
-                    let approx = new cv.Mat();
-                    cv.approxPolyDP(cnt, approx, 0.04 * cv.arcLength(cnt, true), true);
-
-                    if (approx.rows === 3) {
-                        // Start Geometric Mesh Logic
-                        // 1. Sort Vertices physically (Top, Left, Right)
-                        // Note: approx.data32S contains [x, y, x, y, x, y]
-                        let pts = [
-                            { x: approx.data32S[0], y: approx.data32S[1] },
-                            { x: approx.data32S[2], y: approx.data32S[3] },
-                            { x: approx.data32S[4], y: approx.data32S[5] }
-                        ];
-
-                        // Sort by Y for Top
-                        pts.sort((a, b) => a.y - b.y);
-                        let top = pts[0];
-                        // Sort others by X
-                        let others = [pts[1], pts[2]].sort((a, b) => a.x - b.x);
-                        let bl = others[0];
-                        let br = others[1];
-
-                        // 2. Generate Physical Triangles (Process Resolution)
-                        let physTris = generatePhysicalTriangles(top, bl, br);
-
-                        // 3. Sample & Decode
-                        let result = decodeSigil(gray, physTris);
-
-                        // Draw Live Overlay (Green Lines)
-                        drawLiveOverlay(physTris, result); // Always draw lines
-
-                        if (result && result.valid) {
-                            bestResult = result;
-                            // Set cached mesh for the Lock State
-                            cachedMesh = { tris: physTris, bits: result.logBits, rawBits: result.rawBits, id: result.id };
-                            cachedId = result.idString;
-
-                            resultDisplay.textContent = "ID: " + result.idString;
-                            resultDisplay.className = "success";
-                        }
-                    }
-                    approx.delete();
-                }
-            }
-
-            // Memory Management
-            src.delete(); gray.delete(); binary.delete();
-            contours.delete(); hierarchy.delete();
-
-            return bestResult !== null;
-        }
-
-        function generatePhysicalTriangles(v1, v2, v3) {
-            // Map i=>v1, j=>v2, k=>v3
-            let tris = [];
-            for (let i = 0; i < 16; i++) {
-                let def = LOGICAL_GRID[i]; // Definition in i,j,k integers
-                let verts = def.verts.map(v => {
-                    // Barycentric Interpolation
-                    // P = (i*V1 + j*V2 + k*V3) / 4.0
-                    return {
-                        x: (v.i * v1.x + v.j * v2.x + v.k * v3.x) / 4.0,
-                        y: (v.i * v1.y + v.j * v2.y + v.k * v3.y) / 4.0
-                    };
-                });
-                // Centroid
-                let c = {
-                    x: (def.center.i * v1.x + def.center.j * v2.x + def.center.k * v3.x) / 4.0,
-                    y: (def.center.i * v1.y + def.center.j * v2.y + def.center.k * v3.y) / 4.0
-                };
-                tris.push({ verts: verts, center: c, id: i });
-            }
-            return tris;
-        }
-
-        function decodeSigil(gray, tris) {
-            // 1. Sample Luminance (3x3 average)
-            let samples = tris.map(t => {
-                let cx = Math.floor(t.center.x);
-                let cy = Math.floor(t.center.y);
-                let sum = 0, count = 0;
-                for (let dy = -1; dy <= 1; dy++) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        if (cx + dx >= 0 && cx + dx < gray.cols && cy + dy >= 0 && cy + dy < gray.rows) {
-                            sum += gray.ucharPtr(cy + dy, cx + dx)[0];
-                            count++;
-                        }
-                    }
-                }
-                return { val: count ? sum / count : 255, idx: t.id };
-            });
-
-            // 2. Adaptive Threshold
-            // Sort and pick midpoint between 4th and 12th
-            let sorted = [...samples].sort((a, b) => a.val - b.val);
-            let darkRef = sorted[3].val;
-            let lightRef = sorted[11].val;
-            let thresh = (darkRef + lightRef) / 2;
-
-            // Raw Bits (Physical Index)
-            let rawBits = samples.map(s => s.val < thresh ? 1 : 0);
-
-            // 3. Anchor Detection (Indices 0, 9, 15)
-            let c0 = samples[0].val;  // Top
-            let c9 = samples[9].val;  // BL
-            let c15 = samples[15].val; // BR
-
-            let corners = [{ v: c0, idx: 0 }, { v: c9, idx: 9 }, { v: c15, idx: 15 }];
-            corners.sort((a, b) => a.v - b.v);
-            // Two darkest are anchors
-            let a1 = corners[0].idx;
-            let a2 = corners[1].idx;
-
-            // Determine Orientation
-            let orientation = -1;
-            // Pairs: (0,9)=Std, (9,15)=Rot120(CW?), (15,0)=Rot240(CW?)
-            // Standard: Top(0) and BL(9) are black.
-            if ((a1 == 0 && a2 == 9) || (a1 == 9 && a2 == 0)) orientation = 0;
-            else if ((a1 == 9 && a2 == 15) || (a1 == 15 && a2 == 9)) orientation = 1;
-            else if ((a1 == 15 && a2 == 0) || (a1 == 0 && a2 == 15)) orientation = 2;
-
-            if (orientation === -1) return { valid: false }; // Ambiguous
-
-            // 4. Remap Bits
-            // Map Logical Index -> Physical Index
-            let logicalBits = new Array(16);
-            for (let l = 0; l < 16; l++) {
-                let pIdx = getPhysicalIndex(l, orientation);
-                logicalBits[l] = rawBits[pIdx];
-            }
-
-            // 5. Parity & Decode
-            // Map: D1..D9 -> 1..8, 10
-            // P1..P4 -> 11..14
-            let D = [0, logicalBits[1], logicalBits[2], logicalBits[3], logicalBits[4],
-                logicalBits[5], logicalBits[6], logicalBits[7], logicalBits[8], logicalBits[10]];
-            let P = [0, logicalBits[11], logicalBits[12], logicalBits[13], logicalBits[14]];
-
-            // Verify Checksums
-            let calcP1 = D[1] ^ D[2] ^ D[4] ^ D[5] ^ D[7] ^ D[9];
-            let calcP2 = D[3] ^ D[4] ^ D[5] ^ D[6] ^ D[8] ^ D[9];
-            let calcP3 = D[1] ^ D[3] ^ D[4] ^ D[7] ^ D[8];
-            let calcP4 = D[2] ^ D[5] ^ D[6] ^ D[8] ^ D[9];
-
-            if (calcP1 === P[1] && calcP2 === P[2] && calcP3 === P[3] && calcP4 === P[4]) {
-                let idVal = parseInt(D.slice(1).join(''), 2);
-                return { valid: true, id: idVal, idString: idVal.toString(), logBits: logicalBits, rawBits: rawBits };
-            }
-            return { valid: false, bits: rawBits };
-        }
-
-        function getPhysicalIndex(logicalIdx, orientation) {
-            if (orientation === 0) return logicalIdx;
-
-            // Get Logical Barycentric Center
-            let lC = LOGICAL_GRID[logicalIdx].center; // {i, j, k}
-
-            // Rotate Coords to find Physical Target
-            // Rotation (CW): 
-            // Log Top (i max) -> Phys BR (k max)? No wait.
-            // Rot 1 (120 deg CW): 
-            //   Visual Top moves to Visual BR.
-            //   So if we want Logical Top (i=1), it is now at Physical BR (k=1).
-            //   So to read Logical u (i), we look at Physical w (k).
-            //   L_i -> P_k
-            //   L_j (BL) -> P_i (Top) (Moves up)
-            //   L_k (BR) -> P_j (BL) (Moves left)
-
-            let targetI, targetJ, targetK;
-
-            if (orientation === 1) { // 9 & 15 Black (Rot 120) -> Top is 15 (BR)
-                // Is this CW or CCW? 
-                // Standard: Top(0), BL(9).
-                // If Top is now 15 (BR), the triangle rotated CCW? 
-                // Or the Camera rotated CW?
-                // Prompt: "If Index 9 and 15 are black... Orientation = 120 deg".
-                // 9 is BL, 15 is BR.
-                // If these are the anchors, it implies the original (Top/BL) edge is now the (BL/BR) edge.
-                // So Top->BL, BL->BR.
-                // This is a Shift Left (CCW).
-                // Map:
-                // Logical Top (At 'Top') corresponds to Physical Top (Phys 0)? No.
-                // The "Anchors" define the Logical Top.
-                // If Anchors are 9 and 15, the "Logical Top" is relative to them.
-                // If 9(BL) and 15(BR) are anchors, and normally 0(Top) and 9(BL) are anchors...
-                // Then the 'Left Side' (0-9) has moved to 'Bottom Side' (9-15).
-                // So 0->9, 9->15.
-                // Top -> BL.
-                // So Logical Top is at Physical BL. 
-                // Logical i (Top) -> Physical j (BL).
-                // Logical j (BL) -> Physical k (BR).
-                // Logical k (BR) -> Physical i (Top).
-
-                targetI = lC.k; // No wait.
-                // We want the Physical Index where the content for Logical X lies.
-                // If Logical Top is at Physical BL...
-                // To read Logical Top, read Physical BL.
-                // So Phys_Target has coords matching BL (j high).
-                // Logic_Top has i high.
-                // So P_j = L_i.
-                // P_k = L_j.
-                // P_i = L_k.
-
-                targetI = lC.k;
-                targetJ = lC.i;
-                targetK = lC.j;
-            } else { // Orientation 2 (15 & 0 Black)
-                // Anchors are 15(BR) and 0(Top).
-                // Original: 0(Top), 9(BL).
-                // So 'Left Side' (0-9) has moved to 'Right Side' (0-15)? No, 15-0.
-                // The sequence 0->9 has become 15->0.
-                // So Top->BR? (0 is at 0? No, 0 is anchor 2).
-                // Wait. 
-                // Pair 1 (Log Top) -> Pair 1 (Phys 15).
-                // Pair 2 (Log BL)  -> Pair 2 (Phys 0).
-                // So Log Top -> Phys BR.
-                // Log BL -> Phys Top.
-                // Log BR -> Phys BL.
-
-                // P_k = L_i.
-                // P_i = L_j.
-                // P_j = L_k.
-
-                targetI = lC.j;
-                targetJ = lC.k;
-                targetK = lC.i;
-            }
-
-            // Find Physical Index best matching (targetI, targetJ, targetK)
-            // Since we use exact integers / 4.0, we can match exactly or closest.
-            let best = -1, minD = 999;
-            for (let p = 0; p < 16; p++) {
-                let pc = LOGICAL_GRID[p].center; // {i,j,k}
-                let d = Math.abs(pc.i - targetI) + Math.abs(pc.j - targetJ) + Math.abs(pc.k - targetK);
-                if (d < 0.1) return p;
-                if (d < minD) { minD = d; best = p; }
-            }
-            return best;
-        }
-
-        // ---------------------------------------------------------
-        // 5. Rendering
-        // ---------------------------------------------------------
-
-        function drawLiveOverlay(tris, result) {
-            oCtx.clearRect(0, 0, overlay.width, overlay.height);
-
-            let sX = overlay.width / PROCESS_WIDTH;
-            let sY = overlay.height / hCanvas.height;
-
-            oCtx.lineWidth = 2;
-            oCtx.lineJoin = "round";
-            oCtx.strokeStyle = "#0f0";
-
-            // Draw Mesh
-            for (let t of tris) {
-                oCtx.beginPath();
-                oCtx.moveTo(t.verts[0].x * sX, t.verts[0].y * sY);
-                oCtx.lineTo(t.verts[1].x * sX, t.verts[1].y * sY);
-                oCtx.lineTo(t.verts[2].x * sX, t.verts[2].y * sY);
-                oCtx.closePath();
-                oCtx.stroke();
-            }
-        }
-
-        function drawLockedState() {
-            if (!cachedMesh) return;
-
-            oCtx.clearRect(0, 0, overlay.width, overlay.height);
-
-            let sX = overlay.width / PROCESS_WIDTH;
-            let sY = overlay.height / hCanvas.height;
-
-            oCtx.lineWidth = 3;
-            oCtx.strokeStyle = "#0f0";
-
-            // Draw Fill
-            for (let i = 0; i < 16; i++) {
-                let t = cachedMesh.tris[i];
-                let val = cachedMesh.rawBits ? cachedMesh.rawBits[i] : 0;
-
-                oCtx.fillStyle = val === 1 ? "rgba(0, 255, 0, 0.4)" : "rgba(255, 255, 255, 0.4)";
-
-                oCtx.beginPath();
-                oCtx.moveTo(t.verts[0].x * sX, t.verts[0].y * sY);
-                oCtx.lineTo(t.verts[1].x * sX, t.verts[1].y * sY);
-                oCtx.lineTo(t.verts[2].x * sX, t.verts[2].y * sY);
-                oCtx.closePath();
-                oCtx.fill();
-                oCtx.stroke();
-            }
-
-            // Draw ID Text overlay? Already in DOM.
+        } else {
+            // Load dynamically if needed, or wait for script load
+            document.querySelector('script[src="opencv.js"]').onload = function () {
+                cv['onRuntimeInitialized'] = onOpenCvReady;
+            };
         }
     </script>
 </body>
